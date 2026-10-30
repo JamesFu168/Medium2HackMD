@@ -13,6 +13,7 @@
   // Time-based (not tick-based) so background-tab timer throttling cannot shorten the wait
   const STABLE_MS = 9000; // 內容連續 9 秒完全不變且至少觀察 2 次才視為完成
   const INVALID_STABLE_MS = 60000; // 內容穩定但未通過檢查時，最多再等 60 秒
+  const STALE_STREAMING_MS = 90000; // 串流指示器持續存在但內容 90 秒毫無變化 → 視為指示器誤判
   const DEFAULT_MAX_WAIT_MS = 15 * 60 * 1000;
   const PROGRESS_THROTTLE_MS = 2500;
   const THINKING_RE =
@@ -125,35 +126,158 @@
     );
   }
 
-  function getAssistantTurns() {
-    const byRole = Array.from(
-      document.querySelectorAll('[data-message-author-role="assistant"]')
-    );
-    if (byRole.length > 0) {
-      return byRole;
-    }
-    const byAgentTurn = Array.from(
-      document.querySelectorAll('article[data-testid^="conversation-turn-"] .agent-turn, .agent-turn')
-    );
-    if (byAgentTurn.length > 0) {
-      return byAgentTurn;
-    }
-    // Fallback: any .markdown container not inside a user message
-    return Array.from(document.querySelectorAll('main .markdown')).filter(
-      (el) => !el.closest('[data-message-author-role="user"]')
+  const COMPOSER_ANCESTOR_SELECTOR = 'form, [data-type="unified-composer"], #composer-background, [class*="composer"]';
+
+  function isInsideComposer(el) {
+    return Boolean(el && (el.closest(COMPOSER_ANCESTOR_SELECTOR) || el.closest('#prompt-textarea')));
+  }
+
+  function isUserTurn(el) {
+    return Boolean(
+      el.matches('[data-message-author-role="user"], [data-turn="user"]') ||
+        el.closest('[data-message-author-role="user"], [data-turn="user"]') ||
+        el.querySelector('[data-message-author-role="user"], [data-turn="user"]')
     );
   }
 
+  // Which selector strategy found the assistant turns (for diagnostics)
+  let lastTurnStrategy = '';
+
+  function getAssistantTurns() {
+    const strategies = [
+      ['role', () => Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'))],
+      ['data-turn', () => Array.from(document.querySelectorAll('article[data-turn="assistant"], [data-turn="assistant"]'))],
+      ['agent-turn', () => Array.from(document.querySelectorAll('article[data-testid^="conversation-turn-"] .agent-turn, .agent-turn'))],
+      [
+        'conversation-turn',
+        () => {
+          // Turn containers without role markers: keep the ones that are not user turns
+          const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn"], main article'));
+          if (turns.length === 0) return [];
+          const marked = turns.filter((t) => t.querySelector('[data-message-author-role], [data-turn]'));
+          if (marked.length > 0) return turns.filter((t) => !isUserTurn(t) && !isInsideComposer(t));
+          // No markers at all: assume alternating user/assistant, assistant = even index (0-based odd)
+          return turns.filter((t, idx) => idx % 2 === 1 && !isInsideComposer(t));
+        }
+      ],
+      [
+        'markdown',
+        () =>
+          Array.from(document.querySelectorAll('main .markdown, main .prose, main [data-message-id]')).filter(
+            (el) => !isUserTurn(el) && !isInsideComposer(el) && !el.closest('.markdown .markdown, .prose .prose')
+          )
+      ]
+    ];
+
+    for (const [name, fn] of strategies) {
+      let found = [];
+      try {
+        found = fn();
+      } catch (_) {
+        found = [];
+      }
+      if (found.length > 0) {
+        lastTurnStrategy = name;
+        return found;
+      }
+    }
+    lastTurnStrategy = 'none';
+    return [];
+  }
+
+  const NON_STREAM_LABEL_RE = /voice|語音|dictat|聽寫|record|錄音|錄製|speech|microphone|麥克風|video|影片|share|分享/i;
+
+  // Returns the matched indicator (string) or '' when nothing suggests ChatGPT is still generating
+  function getStreamingIndicator() {
+    const direct = [
+      'button[data-testid="stop-button"]',
+      'button[data-testid="composer-stop-button"]',
+      'button[data-testid="composer-submit-button"][aria-label*="Stop" i]',
+      'button[data-testid="composer-submit-button"][aria-label*="停止"]',
+      '#composer-submit-button[aria-label*="Stop" i]',
+      '#composer-submit-button[aria-label*="停止"]',
+      '.result-streaming',
+      '[data-testid="streaming-indicator"]'
+    ];
+    for (const sel of direct) {
+      try {
+        if (document.querySelector(sel)) return sel;
+      } catch (_) {}
+    }
+    // Generic: a Stop button, but only inside the composer area and not a voice/recording control
+    const buttons = Array.from(document.querySelectorAll('button[aria-label*="Stop" i], button[aria-label*="停止"], button[aria-label*="中止"]'));
+    for (const b of buttons) {
+      const label = b.getAttribute('aria-label') || '';
+      if (NON_STREAM_LABEL_RE.test(label)) continue;
+      if (isInsideComposer(b)) return `composer:${label}`;
+    }
+    return '';
+  }
+
   function isChatGPTStreaming() {
-    return Boolean(
-      document.querySelector('button[data-testid="stop-button"]') ||
-      document.querySelector('button[data-testid="composer-stop-button"]') ||
-      document.querySelector('button[aria-label*="Stop"]') ||
-      document.querySelector('button[aria-label*="停止"]') ||
-      document.querySelector('.result-streaming') ||
-      document.querySelector('.result-thinking') ||
-      document.querySelector('[data-testid="streaming-indicator"]')
-    );
+    return Boolean(getStreamingIndicator());
+  }
+
+  // Compact DOM snapshot shipped with diagnostics so selector drift can be fixed from a log
+  function domProbe() {
+    const q = (s) => {
+      try {
+        return document.querySelectorAll(s).length;
+      } catch (_) {
+        return -1;
+      }
+    };
+    const describe = (el) => ({
+      tag: el.tagName.toLowerCase(),
+      id: el.id || undefined,
+      cls: (typeof el.className === 'string' ? el.className : '').slice(0, 80) || undefined,
+      data: Array.from(el.attributes || [])
+        .filter((a) => a.name.startsWith('data-'))
+        .map((a) => `${a.name}=${String(a.value).slice(0, 30)}`)
+        .join(' ')
+        .slice(0, 160) || undefined,
+      len: (el.innerText || '').length
+    });
+    const main = document.querySelector('main');
+    const mainChildren = main ? Array.from(main.querySelectorAll('article, [data-testid^="conversation-turn"], [data-message-id], [data-turn]')).slice(-4) : [];
+    const stopLike = Array.from(document.querySelectorAll('button'))
+      .filter((b) => /stop|停止|中止/i.test(b.getAttribute('aria-label') || '') || /stop/i.test(b.getAttribute('data-testid') || ''))
+      .slice(0, 5)
+      .map((b) => ({
+        testid: b.getAttribute('data-testid') || undefined,
+        aria: b.getAttribute('aria-label') || undefined,
+        id: b.id || undefined,
+        inComposer: isInsideComposer(b)
+      }));
+    const submitLike = Array.from(document.querySelectorAll('button[data-testid*="send"], button[data-testid*="submit"], #composer-submit-button, form button[type="submit"]'))
+      .slice(0, 5)
+      .map((b) => ({
+        testid: b.getAttribute('data-testid') || undefined,
+        aria: b.getAttribute('aria-label') || undefined,
+        id: b.id || undefined,
+        disabled: Boolean(b.disabled)
+      }));
+    return {
+      href: location.href,
+      title: (document.title || '').slice(0, 60),
+      hasMain: Boolean(main),
+      turnStrategy: lastTurnStrategy,
+      streamingMatch: getStreamingIndicator(),
+      counts: {
+        role: q('[data-message-author-role]'),
+        turn: q('[data-turn]'),
+        msgId: q('[data-message-id]'),
+        convTurn: q('[data-testid^="conversation-turn"]'),
+        article: q('main article'),
+        markdown: q('.markdown'),
+        prose: q('.prose'),
+        agentTurn: q('.agent-turn'),
+        prompt: q('#prompt-textarea')
+      },
+      lastTurnLike: mainChildren.map(describe),
+      stopLike,
+      submitLike
+    };
   }
 
   // Signature of the latest non-empty assistant turn, used to detect a NEW reply even when
@@ -283,6 +407,14 @@
 
     if (!autoSend) return { ...base, sent: false };
 
+    const attempts = [];
+    const submitted = async (how) => {
+      await sleep(900);
+      const cleared = !composerHasText(inputEl, fullText);
+      attempts.push(`${how}:${cleared ? 'ok' : 'no'}`);
+      return cleared;
+    };
+
     // React re-renders the send button asynchronously after the editor state updates
     const sendBtn = await waitFor(() => {
       const b = findSendButton();
@@ -291,20 +423,34 @@
 
     if (sendBtn) {
       sendBtn.click();
-      await sleep(900);
-      if (!composerHasText(inputEl, fullText)) return { ...base, sent: true };
+      if (await submitted('click')) return { ...base, sent: true, attempts };
+    } else {
+      attempts.push('no-enabled-send-button');
+    }
 
-      // Click didn't submit; try Enter as a second attempt
+    // Enter key (ProseMirror/React handles keydown on the editor)
+    inputEl.focus();
+    for (const type of ['keydown', 'keypress', 'keyup']) {
       inputEl.dispatchEvent(
-        new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true, cancelable: true })
+        new KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true })
       );
-      await sleep(900);
-      if (!composerHasText(inputEl, fullText)) return { ...base, sent: true };
+    }
+    if (await submitted('enter')) return { ...base, sent: true, attempts };
+
+    // Native form submission as a last resort
+    const form = inputEl.closest('form');
+    if (form && typeof form.requestSubmit === 'function') {
+      try {
+        form.requestSubmit();
+      } catch (_) {}
+      if (await submitted('requestSubmit')) return { ...base, sent: true, attempts };
     }
 
     return {
       ...base,
       sent: false,
+      attempts,
+      probe: domProbe(),
       warning: '已將 Prompt 與文章填入輸入框，但無法自動按下發送，請手動點擊 ChatGPT 的發送按鈕（送出後系統仍會自動偵測完成）。'
     };
   }
@@ -698,7 +844,20 @@
       }
 
       const res = extractLatestAssistantMarkdown();
-      const streaming = res.isStreaming;
+      let streaming = res.isStreaming;
+
+      // Track when the visible content last changed; a "streaming" indicator that stays on while
+      // nothing changes for a long time is treated as a stale/misidentified element.
+      const contentKey = res.ok ? `${res.turnCount}:${res.markdown.length}:${res.markdown.slice(-80)}` : `none:${res.turnCount}`;
+      if (contentKey !== st.lastContentKey) {
+        st.lastContentKey = contentKey;
+        st.lastContentChangeAt = Date.now();
+      }
+      let staleStreaming = false;
+      if (streaming && res.ok && Date.now() - st.lastContentChangeAt > STALE_STREAMING_MS) {
+        streaming = false;
+        staleStreaming = true;
+      }
 
       const hasNewTurn =
         res.ok &&
@@ -709,15 +868,23 @@
           (res.source === 'canvas' && res.canvasSignature !== st.baselineCanvasSignature));
 
       const diag = {
+        href: location.href,
         turns: res.turnCount,
         nonEmpty: res.nonEmptyTurnCount,
         baseline: st.baselineTurnCount,
         newTurn: hasNewTurn,
         streaming,
+        staleStreaming: staleStreaming || undefined,
         thinking: Boolean(res.isThinking),
         source: res.source || '',
+        strategy: lastTurnStrategy,
         extractError: res.ok ? '' : res.error || ''
       };
+      // Ship a DOM snapshot while we cannot see any reply (selector drift) or the URL just changed
+      if (!res.ok || res.turnCount === 0 || location.href !== st.lastHref) {
+        diag.probe = domProbe();
+      }
+      st.lastHref = location.href;
 
       const resetStability = () => {
         st.stableObservations = 0;
@@ -804,6 +971,9 @@
       maxWaitMs: Number(job.maxWaitMs) || DEFAULT_MAX_WAIT_MS,
       stableObservations: 0,
       stableSince: 0,
+      lastContentKey: '',
+      lastContentChangeAt: Date.now(),
+      lastHref: location.href,
       lastMarkdown: '',
       sawNewResponse: false,
       lastProgressAt: 0,
@@ -873,6 +1043,16 @@
 
     if (message?.type === 'CHATGPT_COMPOSER_READY') {
       sendResponse({ ok: true, ready: Boolean(findPromptInput()), readyState: document.readyState });
+      return true;
+    }
+
+    if (message?.type === 'CHATGPT_DOM_PROBE') {
+      try {
+        const res = extractLatestAssistantMarkdown();
+        sendResponse({ ok: true, probe: domProbe(), extract: { ...res, markdown: (res.markdown || '').slice(0, 200) } });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message || String(err) });
+      }
       return true;
     }
   });

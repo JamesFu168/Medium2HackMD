@@ -1329,10 +1329,14 @@ async function findExistingChatGPTTab() {
   ) {
     return activeTab;
   }
-  const existingTabs = await chrome.tabs.query({
-    url: ['https://chatgpt.com/*', 'https://chat.openai.com/*']
-  });
-  return existingTabs[0] || null;
+  const urlFilter = ['https://chatgpt.com/*', 'https://chat.openai.com/*'];
+  // Prefer a ChatGPT tab in the window the side panel belongs to, so the user actually sees it
+  const inCurrentWindow = await chrome.tabs.query({ url: urlFilter, currentWindow: true });
+  if (inCurrentWindow.length > 0) return inCurrentWindow[0];
+  const inFocusedWindow = await chrome.tabs.query({ url: urlFilter, lastFocusedWindow: true });
+  if (inFocusedWindow.length > 0) return inFocusedWindow[0];
+  const anywhere = await chrome.tabs.query({ url: urlFilter });
+  return anywhere[0] || null;
 }
 
 // Poll until ChatGPT's composer exists in the tab (page may still be loading / waking from sleep)
@@ -1806,19 +1810,28 @@ btnSendToChatGPT.addEventListener('click', async () => {
       autoSend: chkAutoSendChatGPT.checked
     });
 
+    let tabInfo = null;
+    try {
+      const t = await chrome.tabs.get(chatTab.id);
+      tabInfo = { url: t.url, title: (t.title || '').slice(0, 60), windowId: t.windowId, active: t.active };
+    } catch (_) {}
+
     sendToBackground({
       type: 'M2H_LOG',
       level: res?.ok ? 'info' : 'error',
       message: 'inject result',
       data: {
         tabId: chatTab.id,
+        tab: tabInfo,
         ok: res?.ok,
         method: res?.method,
         sent: res?.sent,
+        attempts: res?.attempts,
         warning: res?.warning,
         error: res?.error,
         baselineTurnCount: res?.baselineTurnCount,
-        promptChars: fullText.length
+        promptChars: fullText.length,
+        probe: res?.probe
       }
     });
 
@@ -1826,16 +1839,17 @@ btnSendToChatGPT.addEventListener('click', async () => {
       throw new Error(res?.error || '無法填入 ChatGPT 輸入框');
     }
 
+    const tabLabel = tabInfo?.title ? `分頁「${tabInfo.title}」` : 'ChatGPT 分頁';
     if (res.warning) {
-      showStatus(res.warning, 'info', 10000);
+      showStatus(`${res.warning}（目標：${tabLabel}）`, 'info', 12000);
     } else if (res.sent) {
       showStatus(
-        '🚀 已送出給 ChatGPT！系統正在自動等待翻譯完成並將自動存入 Library...',
+        `🚀 已送出給 ${tabLabel}！系統正在自動等待翻譯完成並將自動存入 Library...`,
         'success',
         6000
       );
     } else {
-      showStatus('已將「Prompt + 文章」填入 ChatGPT 輸入框！', 'success');
+      showStatus(`已將「Prompt + 文章」填入 ${tabLabel} 的輸入框！`, 'success');
     }
 
     if (targetArticleId) {
@@ -1872,6 +1886,26 @@ btnCaptureFromChatGPT.addEventListener('click', async () => {
     const chatTab = resolved.tab || (await findOrOpenChatGPTTab());
 
     const res = await extractFromChatGPTTab(chatTab.id);
+
+    // Record what the page looked like so selector drift can be fixed from the diagnostics log
+    try {
+      const probeRes = await chrome.tabs.sendMessage(chatTab.id, { type: 'CHATGPT_DOM_PROBE' });
+      sendToBackground({
+        type: 'M2H_LOG',
+        level: res?.ok ? 'info' : 'error',
+        message: 'manual capture',
+        data: {
+          tabId: chatTab.id,
+          ok: res?.ok,
+          error: res?.error,
+          chars: res?.markdown?.length,
+          source: res?.source,
+          isStreaming: res?.isStreaming,
+          isThinking: res?.isThinking,
+          probe: probeRes?.probe
+        }
+      });
+    } catch (_) {}
 
     if (!res || !res.ok) {
       throw new Error(res?.error || '擷取 ChatGPT 回覆失敗');
