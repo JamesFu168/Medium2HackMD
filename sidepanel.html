@@ -153,6 +153,7 @@
 
         <div id="chatgptAutoStatus" class="progress-box hidden" style="margin-bottom: 8px;">
           <div class="progress-text" id="chatgptAutoStatusText">⏳ 正在等待 ChatGPT 翻譯回覆...</div>
+          <button id="btnCancelChatGPTMonitor" class="btn-xs" type="button">✖ 停止自動偵測</button>
         </div>
 
         <div class="btn-group-vertical">
@@ -162,6 +163,9 @@
           <button id="btnPasteTranslatedFromClipboard" class="btn btn-secondary full-width">
             📋 從剪貼簿載入翻譯結果並存入 Library
           </button>
+        </div>
+        <div class="inline-actions" style="margin-top: 6px; justify-content: flex-end;">
+          <button id="btnCopyDiagLog" class="btn-xs" type="button" title="複製自動偵測的詳細記錄，方便回報問題">🩺 複製診斷記錄</button>
         </div>
 
         <div id="placeholderCheckBadge" class="placeholder-check hidden"></div>

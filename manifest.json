@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Medium2HackMD - Medium 文章擷取、ChatGPT 繁中翻譯與 HackMD 發佈助手",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "擷取 Medium 文章與圖片暫存至 Library，一鍵帶入 Prompt 至 ChatGPT 產生繁體中文 Markdown，並上傳圖片與內容至 HackMD。",
   "permissions": [
     "sidePanel",
@@ -10,7 +10,8 @@
     "scripting",
     "storage",
     "clipboardWrite",
-    "clipboardRead"
+    "clipboardRead",
+    "alarms"
   ],
   "host_permissions": [
     "https://medium.com/*",

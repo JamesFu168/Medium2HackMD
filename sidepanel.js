@@ -37,7 +37,6 @@ let isStep2Dirty = false;
 let activeAsyncLockCount = 0;
 let lastKnownActiveTabUrl = '';
 let activeObjectUrls = [];
-let activeChatGPTMonitorId = 0; // token to cancel previous auto-monitor loop
 
 // ==================== DOM Elements ====================
 const siteBadge = document.getElementById('siteBadge');
@@ -76,6 +75,8 @@ const btnSendToChatGPT = document.getElementById('btnSendToChatGPT');
 const btnCopyPromptAndArticle = document.getElementById('btnCopyPromptAndArticle');
 const chatgptAutoStatus = document.getElementById('chatgptAutoStatus');
 const chatgptAutoStatusText = document.getElementById('chatgptAutoStatusText');
+const btnCancelChatGPTMonitor = document.getElementById('btnCancelChatGPTMonitor');
+const btnCopyDiagLog = document.getElementById('btnCopyDiagLog');
 const btnCaptureFromChatGPT = document.getElementById('btnCaptureFromChatGPT');
 const btnPasteTranslatedFromClipboard = document.getElementById('btnPasteTranslatedFromClipboard');
 const placeholderCheckBadge = document.getElementById('placeholderCheckBadge');
@@ -988,6 +989,8 @@ function renderCurrentArticleViews() {
   updateStep3ContentStatusBanner();
   step3ImageCount.textContent = String(images.length);
   renderStep3ImageList(images);
+
+  renderMonitorStatus();
 }
 
 function renderLibraryManagerTab() {
@@ -1332,15 +1335,54 @@ async function findExistingChatGPTTab() {
   return existingTabs[0] || null;
 }
 
+// Poll until ChatGPT's composer exists in the tab (page may still be loading / waking from sleep)
+async function waitForChatGPTComposer(tabId, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = '';
+  while (Date.now() < deadline) {
+    try {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () =>
+          Boolean(
+            document.querySelector('#prompt-textarea') ||
+              document.querySelector('main form div[contenteditable="true"]') ||
+              document.querySelector('main textarea')
+          )
+      });
+      if (result && result.result) return true;
+    } catch (err) {
+      lastError = err?.message || String(err);
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  throw new Error(
+    `等待 ChatGPT 輸入框就緒逾時${lastError ? `（${lastError}）` : ''}。請確認該分頁已登入且載入完成後再試一次。`
+  );
+}
+
 async function findOrOpenChatGPTTab() {
   const existing = await findExistingChatGPTTab();
   if (existing) {
     await chrome.tabs.update(existing.id, { active: true });
+    // Edge "sleeping tabs": a discarded tab reloads on activation and wipes anything injected early
+    let tab = existing;
+    try {
+      tab = await chrome.tabs.get(existing.id);
+    } catch (_) {}
+    if (tab.discarded) {
+      await chrome.tabs.reload(existing.id);
+    }
+    if (tab.discarded || tab.status !== 'complete') {
+      await waitForTabComplete(existing.id, TAB_LOAD_TIMEOUT_MS);
+    }
+    await waitForChatGPTComposer(existing.id);
     return existing;
   }
 
   const newTab = await chrome.tabs.create({ url: 'https://chatgpt.com/' });
   await waitForTabComplete(newTab.id, TAB_LOAD_TIMEOUT_MS);
+  await waitForChatGPTComposer(newTab.id);
   return newTab;
 }
 
@@ -1385,127 +1427,331 @@ async function saveTranslatedMarkdownToArticle(targetArticleId, markdownText) {
   return saved;
 }
 
-// Automatically monitor ChatGPT tab after sending prompt and save the finished translation into Library
-async function startChatGPTAutoCaptureMonitor(chatTabId, targetArticleId, baselineTurnCount = 0) {
-  const monitorId = ++activeChatGPTMonitorId;
-  chatgptAutoStatus.classList.remove('hidden');
-  chatgptAutoStatusText.textContent = '⏳ 正在等待 ChatGPT 開始生成繁體中文翻譯...';
+// ==================== ChatGPT auto-capture bridge ====================
+// The actual polling runs inside the ChatGPT tab (content/chatgpt.js) and the finished translation
+// is written to IndexedDB by background.js, so closing this side panel no longer loses the result.
+// This section only starts/cancels jobs and mirrors their status in the UI.
 
-  let sawNewResponse = false;
-  let stableCompletedTicks = 0;
-  let lastMarkdown = '';
-  const startTime = Date.now();
-  const maxWaitMs = 4 * 60 * 1000; // Wait up to 4 minutes for long articles
+const MONITOR_PHASE_LABELS = {
+  waiting: '⏳ 正在等待 ChatGPT 開始回覆',
+  streaming: '⏳ ChatGPT 正在翻譯中',
+  thinking: '🧠 ChatGPT 思考中（尚未輸出正文）',
+  stabilizing: '🔎 ChatGPT 似乎已完成，確認內容不再變動',
+  verifying: '🔎 內容已穩定，正在檢查完整性',
+  error: '⚠️ 偵測時發生錯誤，持續重試中'
+};
 
-  while (Date.now() - startTime < maxWaitMs) {
-    await new Promise((r) => setTimeout(r, 1800));
-    if (monitorId !== activeChatGPTMonitorId) return; // Superseded by another monitor
+let monitorJobs = {};
 
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: chatTabId },
-        files: ['content/chatgpt.js']
-      });
+function upsertLocalJob(job) {
+  if (job && job.jobId) monitorJobs[job.jobId] = job;
+}
 
-      const res = await chrome.tabs.sendMessage(chatTabId, {
-        type: 'EXTRACT_FROM_CHATGPT'
-      });
+function findPendingJob(articleId = null, strict = false) {
+  const pending = Object.values(monitorJobs)
+    .filter((j) => j.status === 'pending')
+    .sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+  const own = articleId ? pending.find((j) => j.articleId === articleId) : null;
+  if (own) return own;
+  return strict ? null : pending[0] || null;
+}
 
-      if (monitorId !== activeChatGPTMonitorId) return;
+function findLatestJobForArticle(articleId) {
+  return (
+    Object.values(monitorJobs)
+      .filter((j) => j.articleId === articleId)
+      .sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0))[0] || null
+  );
+}
 
-      if (res && res.ok && res.markdown) {
-        const hasNewTurn =
-          res.turnCount > baselineTurnCount ||
-          res.nonEmptyTurnCount > baselineTurnCount ||
-          res.isStreaming;
+function formatElapsed(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 60 ? `${s} 秒` : `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+}
 
-        if (hasNewTurn) {
-          sawNewResponse = true;
-        }
-
-        if (sawNewResponse) {
-          // Live preview in Step 2 textarea if looking at the same article
-          if (currentArticleId === targetArticleId && !isStep2Dirty) {
-            textareaTranslatedMd.value = res.markdown;
-          }
-
-          if (res.isStreaming) {
-            stableCompletedTicks = 0;
-            lastMarkdown = res.markdown;
-            chatgptAutoStatusText.textContent = `⏳ ChatGPT 正在翻譯中...（目前已生成 ${res.markdown.length} 字，完成後將自動存入 Library）`;
-          } else {
-            if (res.markdown === lastMarkdown && res.markdown.length > 20) {
-              stableCompletedTicks++;
-            } else {
-              lastMarkdown = res.markdown;
-              stableCompletedTicks = 1;
-            }
-
-            // Once streaming has stopped and text is stable for 2 checks (~1.8s), auto-save to Library!
-            if (stableCompletedTicks >= 2) {
-              chatgptAutoStatus.classList.add('hidden');
-              await saveTranslatedMarkdownToArticle(targetArticleId, res.markdown);
-              showStatus(
-                `✅ ChatGPT 翻譯完成！已自動將繁體中文 Markdown (${res.markdown.length} 字) 存入 Library！`,
-                'success',
-                6500
-              );
-              return;
-            }
-          }
-        }
-      }
-    } catch (_) {
-      // Tab might be navigating or busy; continue polling
-    }
-  }
-
-  if (monitorId === activeChatGPTMonitorId) {
+function renderMonitorStatus() {
+  const job = findPendingJob(currentArticleId);
+  if (!job) {
     chatgptAutoStatus.classList.add('hidden');
+    return;
+  }
+  const parts = [MONITOR_PHASE_LABELS[job.phase] || MONITOR_PHASE_LABELS.waiting];
+  if (job.chars > 0) parts.push(`目前 ${job.chars} 字`);
+  parts.push(`已等待 ${formatElapsed(Date.now() - (job.startedAt || Date.now()))}`);
+  if (job.articleId !== currentArticleId && job.articleTitle) parts.push(`文章：${job.articleTitle}`);
+  if (job.note) parts.push(job.note);
+  chatgptAutoStatusText.textContent = `${parts.join('　|　')}。完成後會自動存入 Library（關閉側邊欄也會繼續）。`;
+  chatgptAutoStatus.classList.remove('hidden');
+}
+
+async function sendToBackground(message) {
+  try {
+    return await chrome.runtime.sendMessage(message);
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
   }
 }
 
-// Automatically pull translation from an open ChatGPT tab if currentArticle.translatedMarkdown is still empty
+function computeExpectedMinLength(article) {
+  const raw = (article?.rawContent || '').trim();
+  if (!raw) return 0;
+  // Traditional Chinese is denser than English (~0.3x chars); 12% of the source length is a safe floor
+  return Math.min(Math.round(raw.length * 0.12), 20000);
+}
+
+function getExpectedImgIds(article) {
+  return (article?.images || []).map((img, idx) => sanitizeImageId(img.id, idx + 1));
+}
+
+async function requestStartMonitor(chatTab, injectRes) {
+  if (!currentArticle) return null;
+  const res = await sendToBackground({
+    type: 'M2H_START_MONITOR',
+    tabId: chatTab.id,
+    articleId: currentArticle.id,
+    articleTitle: currentArticle.title || '',
+    conversationUrl: injectRes?.conversationUrl || '',
+    baselineTurnCount: Number(injectRes?.baselineTurnCount) || 0,
+    baselineSignature: injectRes?.baselineSignature || '',
+    baselineCanvasSignature: injectRes?.baselineCanvasSignature || '',
+    expectedImgIds: getExpectedImgIds(currentArticle),
+    expectedMinLength: computeExpectedMinLength(currentArticle)
+  });
+  if (!res || !res.ok) {
+    throw new Error(res?.error || '無法啟動自動偵測');
+  }
+  upsertLocalJob(res.job);
+  renderMonitorStatus();
+  return res.job;
+}
+
+async function cancelActiveMonitor(silent = true) {
+  const pending = findPendingJob(currentArticleId, true);
+  if (!pending) {
+    renderMonitorStatus();
+    return false;
+  }
+  delete monitorJobs[pending.jobId];
+  renderMonitorStatus();
+  await sendToBackground({ type: 'M2H_CANCEL_MONITOR', jobId: pending.jobId, silent });
+  return true;
+}
+
+async function handleTranslationSaved(job) {
+  upsertLocalJob(job);
+  renderMonitorStatus();
+  sendToBackground({ type: 'M2H_CLEAR_BADGE' });
+
+  const extras = [];
+  if (job.source === 'canvas') extras.push('來源：ChatGPT Canvas');
+  if (Array.isArray(job.warnings) && job.warnings.length) extras.push(`注意：${job.warnings.join('；')}`);
+  const extraText = extras.length ? `（${extras.join('；')}）` : '';
+
+  if (currentArticleId === job.articleId) {
+    if (!isStep1Dirty && !isStep2Dirty) {
+      await refreshLibraryList(job.articleId);
+    } else {
+      // Don't blow away unsaved edits; merge the saved translation into memory instead
+      const fresh = await getLibraryItem(job.articleId, false);
+      if (fresh && currentArticle) {
+        currentArticle.translatedMarkdown = fresh.translatedMarkdown || '';
+        currentArticle.status = fresh.status || currentArticle.status;
+        if (!isStep2Dirty) textareaTranslatedMd.value = currentArticle.translatedMarkdown;
+        verifyImagePlaceholders(currentArticle);
+        updateStep3ContentStatusBanner();
+      }
+      libraryItems = await getAllLibraryItems();
+      renderLibraryManagerTab();
+    }
+    showStatus(
+      `✅ ChatGPT 翻譯完成！已自動將繁體中文 Markdown（${job.chars} 字）存入 Library ${extraText}`,
+      'success',
+      9000
+    );
+  } else {
+    libraryItems = await getAllLibraryItems();
+    renderLibraryManagerTab();
+    showStatus(
+      `✅ 文章「${job.articleTitle || job.articleId}」的 ChatGPT 翻譯已完成並存入 Library（${job.chars} 字）${extraText}`,
+      'success',
+      9000
+    );
+  }
+}
+
+async function restoreMonitorJobs() {
+  const res = await sendToBackground({ type: 'M2H_GET_MONITOR_JOBS' });
+  monitorJobs = res && res.ok && res.jobs ? res.jobs : {};
+  renderMonitorStatus();
+
+  const recentFailed = Object.values(monitorJobs)
+    .filter((j) => j.status === 'failed')
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0];
+  if (recentFailed) {
+    showStatus(`❌ 上次 ChatGPT 自動擷取失敗：${recentFailed.reason}`, 'error', 0);
+    delete monitorJobs[recentFailed.jobId];
+    sendToBackground({ type: 'M2H_DISMISS_JOB', jobId: recentFailed.jobId });
+  }
+}
+
+chrome.runtime.onMessage.addListener((message) => {
+  const type = message?.type;
+  if (typeof type !== 'string' || !type.startsWith('M2H_')) return false;
+
+  if (type === 'M2H_MONITOR_UPDATE') {
+    upsertLocalJob(message.job);
+    renderMonitorStatus();
+  } else if (type === 'M2H_TRANSLATION_SAVED') {
+    handleTranslationSaved(message.job).catch((err) =>
+      showStatus(`翻譯已存入 Library，但更新畫面時發生錯誤：${err.message}`, 'error')
+    );
+  } else if (type === 'M2H_MONITOR_FAILED') {
+    upsertLocalJob(message.job);
+    renderMonitorStatus();
+    showStatus(`❌ ChatGPT 自動擷取失敗：${message.job?.reason || '未知原因'}`, 'error', 0);
+    sendToBackground({ type: 'M2H_DISMISS_JOB', jobId: message.job?.jobId });
+    if (message.job?.jobId) delete monitorJobs[message.job.jobId];
+  } else if (type === 'M2H_MONITOR_CANCELLED') {
+    if (message.jobId) delete monitorJobs[message.jobId];
+    renderMonitorStatus();
+  }
+  return false;
+});
+
+btnCancelChatGPTMonitor.addEventListener('click', async () => {
+  const job = findPendingJob(currentArticleId);
+  if (!job) {
+    renderMonitorStatus();
+    return;
+  }
+  delete monitorJobs[job.jobId];
+  renderMonitorStatus();
+  await sendToBackground({ type: 'M2H_CANCEL_MONITOR', jobId: job.jobId, silent: true });
+  showStatus('已停止 ChatGPT 自動偵測。翻譯完成後請手動按「立即從 ChatGPT 擷取回覆」。', 'info', 6000);
+});
+
+btnCopyDiagLog.addEventListener('click', async () => {
+  try {
+    const res = await sendToBackground({ type: 'M2H_GET_DIAG_LOG' });
+    if (!res || !res.ok) {
+      throw new Error(res?.error || '背景程式沒有回應（請到 edge://extensions 重新載入擴充功能）');
+    }
+    await navigator.clipboard.writeText(res.text);
+    showStatus('📋 已複製診斷記錄到剪貼簿，可直接貼給開發者分析。', 'success', 6000);
+  } catch (err) {
+    showStatus(`複製診斷記錄失敗：${err.message}`, 'error');
+  }
+});
+
+// Refresh the elapsed-time text while a job is pending
+setInterval(() => {
+  if (findPendingJob(currentArticleId)) renderMonitorStatus();
+}, 5000);
+
+// ==================== Pull translation from an open ChatGPT tab (fallback path) ====================
+
+function validateTranslationCandidate(candidate, article) {
+  const md = (candidate || '').trim();
+  const raw = (article?.rawContent || '').trim();
+  const problems = [];
+
+  if (md.length < 80) problems.push(`內容過短（僅 ${md.length} 字）`);
+  if (raw && md === raw) problems.push('內容與原文完全相同');
+  const minLen = computeExpectedMinLength(article);
+  if (minLen && md.length < minLen) {
+    problems.push(`長度 ${md.length} 字遠低於原文預期（至少約 ${minLen} 字）`);
+  }
+  const imgIds = getExpectedImgIds(article);
+  if (imgIds.length >= 2 && !imgIds.some((id) => md.includes(`{{${id}}}`))) {
+    problems.push('完全沒有這篇文章的圖片佔位符，可能是其他對話的回覆');
+  }
+  return problems;
+}
+
+const CHATGPT_URL_RE = /^https:\/\/(chatgpt\.com|chat\.openai\.com)\//;
+
+// Prefer the tab the prompt was actually sent from; fall back to the active / first ChatGPT tab
+async function resolveChatGPTTabForArticle(articleId) {
+  const job = articleId ? findLatestJobForArticle(articleId) : null;
+  if (job && typeof job.tabId === 'number') {
+    try {
+      const tab = await chrome.tabs.get(job.tabId);
+      if (tab?.url && CHATGPT_URL_RE.test(tab.url)) return { tab, fromJob: true, ambiguous: false };
+    } catch (_) {}
+  }
+  const activeTab = await getActiveTab();
+  if (activeTab?.url && CHATGPT_URL_RE.test(activeTab.url)) {
+    return { tab: activeTab, fromJob: false, ambiguous: false };
+  }
+  const tabs = await chrome.tabs.query({ url: ['https://chatgpt.com/*', 'https://chat.openai.com/*'] });
+  return { tab: tabs[0] || null, fromJob: false, ambiguous: tabs.length > 1 };
+}
+
+async function extractFromChatGPTTab(tabId) {
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['content/chatgpt.js']
+  });
+  return chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_FROM_CHATGPT' });
+}
+
+// Automatically pull translation from an open ChatGPT tab if the article has no saved translation yet
 async function tryPullTranslationFromOpenChatGPT(silent = false) {
   if (!currentArticle) return false;
-  const existingTranslated = (
-    textareaTranslatedMd.value ||
-    currentArticle.translatedMarkdown ||
-    ''
-  ).trim();
-  if (existingTranslated.length > 0) {
-    return true;
+  if ((currentArticle.translatedMarkdown || '').trim().length > 0) return true;
+  // Only trust the textarea when the user actually typed in it (it is saved by syncAndSaveDirtyEdits)
+  if (isStep2Dirty && textareaTranslatedMd.value.trim().length > 0) return true;
+
+  const pending = findPendingJob(currentArticle.id, true);
+  if (pending) {
+    if (!silent) {
+      showStatus('⏳ 此文章的 ChatGPT 翻譯仍在自動偵測中，完成後會自動存入 Library，請稍候。', 'info', 7000);
+    }
+    return false;
   }
 
-  const chatTab = await findExistingChatGPTTab();
-  if (!chatTab || !chatTab.id) return false;
+  const { tab, ambiguous } = await resolveChatGPTTabForArticle(currentArticle.id);
+  if (!tab || !tab.id) return false;
 
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId: chatTab.id },
-      files: ['content/chatgpt.js']
-    });
-
-    const res = await chrome.tabs.sendMessage(chatTab.id, {
-      type: 'EXTRACT_FROM_CHATGPT'
-    });
-
-    if (res && res.ok && res.markdown) {
-      const candidate = res.markdown.trim();
-      const rawTrimmed = (currentArticle.rawContent || '').trim();
-      if (candidate.length > 0 && candidate !== rawTrimmed) {
-        await saveTranslatedMarkdownToArticle(currentArticle.id, candidate);
-        if (!silent) {
-          showStatus(
-            `✅ 已自動從開啟的 ChatGPT 分頁擷取繁體中文翻譯 (${candidate.length} 字) 存入 Library！`,
-            'success'
-          );
-        }
-        return true;
-      }
+    const res = await extractFromChatGPTTab(tab.id);
+    if (!res || !res.ok || !res.markdown) {
+      if (!silent) showStatus(`無法從 ChatGPT 分頁取得回覆：${res?.error || '未知錯誤'}`, 'info', 7000);
+      return false;
     }
-  } catch (_) {}
-  return false;
+    if (res.isStreaming || res.isThinking) {
+      if (!silent) showStatus('⏳ ChatGPT 仍在生成回覆，尚未擷取。請等它完成後再試。', 'info', 7000);
+      return false;
+    }
+
+    const candidate = res.markdown.trim();
+    const problems = validateTranslationCandidate(candidate, currentArticle);
+    if (problems.length > 0) {
+      if (!silent) {
+        showStatus(
+          `⚠️ 開啟的 ChatGPT 分頁回覆未自動採用：${problems.join('；')}。若確認內容無誤，請在步驟 2 按「立即從 ChatGPT 擷取回覆」強制存入。`,
+          'info',
+          10000
+        );
+      }
+      return false;
+    }
+
+    await saveTranslatedMarkdownToArticle(currentArticle.id, candidate);
+    if (!silent) {
+      showStatus(
+        `✅ 已自動從開啟的 ChatGPT 分頁擷取繁體中文翻譯 (${candidate.length} 字) 存入 Library！${
+          ambiguous ? '（您開了多個 ChatGPT 分頁，請確認內容正確）' : ''
+        }`,
+        'success',
+        8000
+      );
+    }
+    return true;
+  } catch (err) {
+    if (!silent) showStatus(`從 ChatGPT 分頁擷取失敗：${err.message}`, 'error');
+    return false;
+  }
 }
 
 btnOpenChatGPT.addEventListener('click', async () => {
@@ -1560,12 +1806,28 @@ btnSendToChatGPT.addEventListener('click', async () => {
       autoSend: chkAutoSendChatGPT.checked
     });
 
+    sendToBackground({
+      type: 'M2H_LOG',
+      level: res?.ok ? 'info' : 'error',
+      message: 'inject result',
+      data: {
+        tabId: chatTab.id,
+        ok: res?.ok,
+        method: res?.method,
+        sent: res?.sent,
+        warning: res?.warning,
+        error: res?.error,
+        baselineTurnCount: res?.baselineTurnCount,
+        promptChars: fullText.length
+      }
+    });
+
     if (!res || !res.ok) {
       throw new Error(res?.error || '無法填入 ChatGPT 輸入框');
     }
 
     if (res.warning) {
-      showStatus(res.warning, 'info');
+      showStatus(res.warning, 'info', 10000);
     } else if (res.sent) {
       showStatus(
         '🚀 已送出給 ChatGPT！系統正在自動等待翻譯完成並將自動存入 Library...',
@@ -1577,11 +1839,15 @@ btnSendToChatGPT.addEventListener('click', async () => {
     }
 
     if (targetArticleId) {
-      startChatGPTAutoCaptureMonitor(
-        chatTab.id,
-        targetArticleId,
-        typeof res.baselineTurnCount === 'number' ? res.baselineTurnCount : 0
-      );
+      try {
+        await requestStartMonitor(chatTab, res);
+      } catch (monitorErr) {
+        showStatus(
+          `已送出給 ChatGPT，但自動偵測啟動失敗：${monitorErr.message}。翻譯完成後請手動按「立即從 ChatGPT 擷取回覆」。`,
+          'error',
+          10000
+        );
+      }
     }
   } catch (err) {
     showStatus(`送入 ChatGPT 失敗：${err.message}`, 'error');
@@ -1593,30 +1859,32 @@ btnSendToChatGPT.addEventListener('click', async () => {
 
 btnCaptureFromChatGPT.addEventListener('click', async () => {
   try {
-    activeChatGPTMonitorId++; // Cancel any background auto-poll
-    chatgptAutoStatus.classList.add('hidden');
+    await cancelActiveMonitor(true); // Manual capture supersedes the background auto-detect job
 
     await syncAndSaveDirtyEdits(true);
     const targetArticleId = currentArticle ? currentArticle.id : null;
 
     lockArticleSwitcher();
     btnCaptureFromChatGPT.disabled = true;
-    const chatTab = await findOrOpenChatGPTTab();
 
-    await chrome.scripting.executeScript({
-      target: { tabId: chatTab.id },
-      files: ['content/chatgpt.js']
-    });
+    // Prefer the tab the prompt was sent from; otherwise the active/first ChatGPT tab, or open one
+    const resolved = await resolveChatGPTTabForArticle(targetArticleId);
+    const chatTab = resolved.tab || (await findOrOpenChatGPTTab());
 
-    const res = await chrome.tabs.sendMessage(chatTab.id, {
-      type: 'EXTRACT_FROM_CHATGPT'
-    });
+    const res = await extractFromChatGPTTab(chatTab.id);
 
     if (!res || !res.ok) {
       throw new Error(res?.error || '擷取 ChatGPT 回覆失敗');
     }
+    if (res.isThinking) {
+      throw new Error('ChatGPT 目前仍在「思考中」，尚未輸出翻譯正文，請稍候再按一次。');
+    }
 
     await saveTranslatedMarkdownToArticle(targetArticleId, res.markdown);
+
+    const problems = currentArticle ? validateTranslationCandidate(res.markdown, currentArticle) : [];
+    const sourceNote = res.source === 'canvas' ? '（來源：ChatGPT Canvas）' : '';
+    const tabNote = resolved.ambiguous && !resolved.fromJob ? '（您開了多個 ChatGPT 分頁，已取第一個，請確認內容）' : '';
 
     if (res.isStreaming) {
       showStatus(
@@ -1624,10 +1892,17 @@ btnCaptureFromChatGPT.addEventListener('click', async () => {
         'info',
         6000
       );
+    } else if (problems.length > 0) {
+      showStatus(
+        `⚠️ 已存入 Library（${res.markdown.length} 字）${sourceNote}，但內容檢查有疑慮：${problems.join('；')}。請確認 ChatGPT 頁面是否為本篇文章的完整翻譯。`,
+        'info',
+        10000
+      );
     } else {
       showStatus(
-        `✅ 已成功從 ChatGPT 擷取繁體中文 Markdown（共 ${res.markdown.length} 字）存入 Library！`,
-        'success'
+        `✅ 已成功從 ChatGPT 擷取繁體中文 Markdown（共 ${res.markdown.length} 字）存入 Library！${sourceNote}${tabNote}`,
+        'success',
+        7000
       );
     }
   } catch (err) {
@@ -1640,8 +1915,7 @@ btnCaptureFromChatGPT.addEventListener('click', async () => {
 
 btnPasteTranslatedFromClipboard.addEventListener('click', async () => {
   try {
-    activeChatGPTMonitorId++;
-    chatgptAutoStatus.classList.add('hidden');
+    await cancelActiveMonitor(true);
 
     const clipText = await navigator.clipboard.readText();
     const cleaned = unwrapOuterMarkdownFence(clipText);
@@ -1765,6 +2039,17 @@ async function ensureTranslationOrConfirmRawFallback() {
 
   if ((currentArticle.translatedMarkdown || '').trim().length > 0) {
     return { ok: true, allowRaw: false };
+  }
+
+  // A background auto-detect job is still running for this article: don't fall back to raw text
+  if (findPendingJob(currentArticle.id, true)) {
+    switchTab('step2');
+    showStatus(
+      '⏳ 此文章的 ChatGPT 翻譯仍在自動偵測中，完成後會自動存入 Library，請稍候再上傳。若 ChatGPT 其實已完成，可按「立即從 ChatGPT 擷取回覆」。',
+      'info',
+      9000
+    );
+    return { ok: false, allowRaw: false };
   }
 
   // Try pulling automatically from open ChatGPT tab first
@@ -2019,4 +2304,5 @@ btnDownloadMarkdownFile.addEventListener('click', async () => {
   await updateSiteBadge();
   await initPromptSetting();
   await refreshLibraryList();
+  await restoreMonitorJobs();
 })();
