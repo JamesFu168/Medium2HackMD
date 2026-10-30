@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Medium2HackMD 助手</title>
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <!-- Top Header -->
+  <header class="app-header">
+    <div class="brand-row">
+      <div class="brand-title">
+        <span class="brand-icon">📑</span>
+        <span>Medium2HackMD</span>
+      </div>
+      <div id="siteBadge" class="site-badge">偵測分頁中...</div>
+    </div>
+
+    <!-- Current Active Library Item Selector -->
+    <div class="active-article-bar">
+      <label for="activeArticleSelect" class="sr-only">目前工作文章</label>
+      <select id="activeArticleSelect" title="選擇 Library 中的文章">
+        <option value="">-- 尚無擷取的文章 --</option>
+      </select>
+      <button id="btnNewBlankArticle" class="icon-btn" title="建立空白文章項目">＋</button>
+    </div>
+
+    <!-- Step Navigation Tabs -->
+    <nav class="step-tabs">
+      <button class="step-tab active" data-tab="step1">
+        <span class="step-num">1</span> 擷取文章
+      </button>
+      <button class="step-tab" data-tab="step2">
+        <span class="step-num">2</span> ChatGPT
+      </button>
+      <button class="step-tab" data-tab="step3">
+        <span class="step-num">3</span> HackMD
+      </button>
+      <button class="step-tab" data-tab="library">
+        📚 Library
+      </button>
+    </nav>
+  </header>
+
+  <!-- Toast / Status Banner -->
+  <div id="statusBanner" class="status-banner hidden"></div>
+
+  <!-- Main Content Area -->
+  <main class="app-main">
+    <!-- ==================== TAB 1: MEDIUM CAPTURE ==================== -->
+    <section id="tab-step1" class="tab-panel active">
+      <div class="card">
+        <div class="card-header">
+          <h2>步驟 1：從 Medium 網頁擷取文章與圖片</h2>
+        </div>
+        <p class="hint-text">
+          專為 Medium (`medium.com` 與自訂網域專欄) 最佳化。擷取時會自動下載高解析度原圖並暫存於 Plugin Library (IndexedDB)，同時以 <code>{{IMG_1}}</code> 標記圖片位置。
+        </p>
+        <div class="btn-group">
+          <button id="btnExtractFull" class="btn btn-primary">
+            📥 擷取整篇文章與圖片
+          </button>
+          <button id="btnExtractSelection" class="btn btn-secondary">
+            ✂️ 擷取反白選取範圍
+          </button>
+        </div>
+        <div id="extractProgress" class="progress-box hidden">
+          <div class="progress-text" id="extractProgressText">正在下載並暫存圖片...</div>
+          <div class="progress-bar-wrap">
+            <div class="progress-bar-fill" id="extractProgressBar" style="width: 0%"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Current Article Preview & Edit -->
+      <div id="step1ArticleBox" class="card">
+        <div class="field-group">
+          <label for="inputArticleTitle">文章標題</label>
+          <input type="text" id="inputArticleTitle" placeholder="擷取後自動帶入標題..." />
+        </div>
+        <div class="field-group">
+          <label>來源網址</label>
+          <div id="articleSourceUrl" class="url-display">-</div>
+        </div>
+
+        <div class="field-group">
+          <div class="label-row">
+            <label>已暫存圖片 (<span id="step1ImageCount">0</span> 張)</label>
+          </div>
+          <div id="step1ImageGallery" class="image-gallery empty-hint">
+            尚未擷取圖片
+          </div>
+        </div>
+
+        <div class="field-group">
+          <div class="label-row">
+            <label for="textareaRawContent">擷取原文內容 (含圖片佔位符)</label>
+            <button id="btnSaveRawEdits" class="btn-xs">💾 儲存修改</button>
+          </div>
+          <textarea id="textareaRawContent" rows="10" placeholder="擷取後的原文 Markdown 將顯示於此..."></textarea>
+        </div>
+
+        <button id="btnGoToStep2" class="btn btn-accent full-width">
+          下一步：前往 ChatGPT 翻譯 →
+        </button>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 2: CHATGPT TRANSLATE ==================== -->
+    <section id="tab-step2" class="tab-panel">
+      <div class="card">
+        <div class="card-header">
+          <h2>步驟 2：結合 Prompt 送交 ChatGPT 翻譯</h2>
+          <button id="btnOpenChatGPT" class="btn-xs">🔗 開啟 ChatGPT</button>
+        </div>
+
+        <div class="field-group">
+          <div class="label-row">
+            <label for="textareaPrompt">翻譯與排版 Prompt 設定</label>
+            <div class="inline-actions">
+              <button id="btnSavePrompt" class="btn-xs">💾 儲存 Prompt</button>
+              <button id="btnResetPrompt" class="btn-xs">↺ 還原預設</button>
+            </div>
+          </div>
+          <textarea id="textareaPrompt" rows="6"></textarea>
+        </div>
+
+        <div class="checkbox-row">
+          <label>
+            <input type="checkbox" id="chkAutoSendChatGPT" checked />
+            填入 ChatGPT 輸入框後自動發送
+          </label>
+        </div>
+
+        <div class="btn-group-vertical">
+          <button id="btnSendToChatGPT" class="btn btn-primary full-width">
+            🚀 將「Prompt + 文章」送入 ChatGPT
+          </button>
+          <button id="btnCopyPromptAndArticle" class="btn btn-secondary full-width">
+            📋 複製「Prompt + 文章」至剪貼簿 (手動貼上備用)
+          </button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h2>擷取 ChatGPT 產生的 Markdown 至 Library</h2>
+        </div>
+        <p class="hint-text">
+          送出後系統會<strong>自動偵測 ChatGPT 回覆完成並存入 Library</strong>；您也可以隨時點擊下方按鈕手動擷取或從剪貼簿貼入。
+        </p>
+
+        <div id="chatgptAutoStatus" class="progress-box hidden" style="margin-bottom: 8px;">
+          <div class="progress-text" id="chatgptAutoStatusText">⏳ 正在等待 ChatGPT 翻譯回覆...</div>
+        </div>
+
+        <div class="btn-group-vertical">
+          <button id="btnCaptureFromChatGPT" class="btn btn-success full-width">
+            📥 立即從 ChatGPT 擷取回覆並存入 Library
+          </button>
+          <button id="btnPasteTranslatedFromClipboard" class="btn btn-secondary full-width">
+            📋 從剪貼簿載入翻譯結果並存入 Library
+          </button>
+        </div>
+
+        <div id="placeholderCheckBadge" class="placeholder-check hidden"></div>
+
+        <div class="field-group" style="margin-top: 10px;">
+          <div class="label-row">
+            <label for="textareaTranslatedMd">Library 中的繁體中文 Markdown</label>
+            <button id="btnSaveTranslatedMd" class="btn-xs">💾 儲存修改</button>
+          </div>
+          <textarea id="textareaTranslatedMd" rows="11" placeholder="從 ChatGPT 擷取後的繁體中文 Markdown 會儲存在這裡，您也可以直接在此微調編輯..."></textarea>
+        </div>
+
+        <button id="btnGoToStep3" class="btn btn-accent full-width">
+          下一步：前往 HackMD 上傳發佈 →
+        </button>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 3: HACKMD UPLOAD ==================== -->
+    <section id="tab-step3" class="tab-panel">
+      <div class="card">
+        <div class="card-header">
+          <h2>步驟 3：在 HackMD 上傳 Library 資料與圖片</h2>
+          <button id="btnOpenHackMD" class="btn-xs">🔗 開啟 HackMD</button>
+        </div>
+        <p class="hint-text">
+          請在瀏覽器開啟一篇 <strong>HackMD 筆記編輯頁</strong>。您可以選擇自動上傳暫存圖片並替換 <code>{{IMG_x}}</code>，或使用下方圖片工具單張複製貼上。
+        </p>
+
+        <div id="step3ContentStatus" class="placeholder-check hidden" style="margin-bottom: 10px;"></div>
+
+        <div class="field-group">
+          <label for="selectHackMDInjectMode">HackMD 編輯器寫入模式</label>
+          <select id="selectHackMDInjectMode">
+            <option value="replace">覆蓋目前筆記全部內容 (Replace)</option>
+            <option value="append">附加於目前筆記尾端 (Append)</option>
+            <option value="cursor">插入於目前游標位置 (Cursor)</option>
+          </select>
+        </div>
+
+        <div id="hackmdUploadProgress" class="progress-box hidden">
+          <div class="progress-text" id="hackmdUploadProgressText">正在上傳圖片至 HackMD...</div>
+          <div class="progress-bar-wrap">
+            <div class="progress-bar-fill" id="hackmdUploadProgressBar" style="width: 0%"></div>
+          </div>
+        </div>
+
+        <div class="btn-group-vertical">
+          <button id="btnHackMDUploadAllAndInject" class="btn btn-primary full-width">
+            📤 自動上傳暫存圖片至 HackMD 並寫入 Markdown
+          </button>
+          <button id="btnHackMDInjectWithOriginalUrls" class="btn btn-secondary full-width">
+            ⚡ 以原始圖片網址替換 {{IMG_x}} 並直接寫入 HackMD
+          </button>
+          <div class="btn-group">
+            <button id="btnCopyFinalMarkdown" class="btn btn-outline">
+              📋 複製最終 Markdown
+            </button>
+            <button id="btnDownloadMarkdownFile" class="btn btn-outline">
+              💾 下載 .md 檔案
+            </button>
+          </div>
+          <button id="btnMarkAsPublished" class="btn btn-success full-width">
+            ✅ 確認 HackMD 已儲存並標記為「已發佈」
+          </button>
+        </div>
+      </div>
+
+      <!-- Stored Images Manual Copy / Upload Helper -->
+      <div class="card">
+        <div class="card-header">
+          <h2>暫存圖片管理與手動貼上助手 (<span id="step3ImageCount">0</span> 張)</h2>
+        </div>
+        <p class="hint-text">
+          若您偏好手動貼圖，可點擊任一圖片的「<strong>複製圖片檔</strong>」，再到 HackMD 編輯器按 <kbd>Ctrl</kbd>+<kbd>V</kbd> 直接上傳貼入！
+        </p>
+        <div id="step3ImageList" class="step3-image-list empty-hint">
+          目前文章無暫存圖片
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 4: LIBRARY MANAGER ==================== -->
+    <section id="tab-library" class="tab-panel">
+      <div class="card">
+        <div class="card-header">
+          <h2>📚 Library 文章資料庫</h2>
+          <span id="libraryTotalBadge" class="badge">0 篇</span>
+        </div>
+        <p class="hint-text">
+          所有擷取的文章、暫存圖片與 ChatGPT 翻譯結果皆保存在本機 IndexedDB 中，跨分頁或重開瀏覽器皆不會遺失。
+        </p>
+        <div id="libraryListContainer" class="library-list">
+          <div class="empty-hint">Library 目前尚無文章</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="sidepanel.js"></script>
+</body>
+</html>
