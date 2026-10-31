@@ -1339,27 +1339,44 @@ async function findExistingChatGPTTab() {
   return anywhere[0] || null;
 }
 
-// Poll until ChatGPT's composer exists in the tab (page may still be loading / waking from sleep)
+// Ask every frame of the tab where a VISIBLE composer lives (ChatGPT keeps hidden editors around in
+// iframes / previous panes). Returns { frameId, info } or null.
+async function findComposerFrame(tabId) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    files: ['content/chatgpt.js']
+  });
+  const frameIds = (results || []).map((r) => r.frameId).filter((id) => typeof id === 'number');
+  if (frameIds.length === 0) frameIds.push(0);
+  const infos = [];
+  for (const frameId of frameIds) {
+    try {
+      const info = await chrome.tabs.sendMessage(tabId, { type: 'CHATGPT_COMPOSER_READY' }, { frameId });
+      if (info && info.ok) infos.push({ frameId, info });
+    } catch (_) {}
+  }
+  const score = (f) => (f.info.visible ? 4 : 0) + (f.info.ready ? 2 : 0) + (f.info.isTop ? 1 : 0);
+  infos.sort((a, b) => score(b) - score(a));
+  const best = infos[0];
+  return best && best.info.ready ? { ...best, frames: infos.map((f) => ({ frameId: f.frameId, ...f.info })) } : null;
+}
+
+// Poll until a visible ChatGPT composer exists in some frame (page may still be loading / waking)
 async function waitForChatGPTComposer(tabId, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   let lastError = '';
+  let lastSeen = null;
   while (Date.now() < deadline) {
     try {
-      const [result] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () =>
-          Boolean(
-            document.querySelector('#prompt-textarea') ||
-              document.querySelector('main form div[contenteditable="true"]') ||
-              document.querySelector('main textarea')
-          )
-      });
-      if (result && result.result) return true;
+      const found = await findComposerFrame(tabId);
+      if (found && found.info.visible) return found;
+      if (found) lastSeen = found;
     } catch (err) {
       lastError = err?.message || String(err);
     }
     await new Promise((r) => setTimeout(r, 400));
   }
+  if (lastSeen) return lastSeen; // exists but not reported visible; let injection try anyway
   throw new Error(
     `等待 ChatGPT 輸入框就緒逾時${lastError ? `（${lastError}）` : ''}。請確認該分頁已登入且載入完成後再試一次。`
   );
@@ -1878,16 +1895,20 @@ btnSendToChatGPT.addEventListener('click', async () => {
     showStatus('正在連線至 ChatGPT 分頁並填入 Prompt...', 'info');
     const chatTab = await findOrOpenChatGPTTab();
 
-    await chrome.scripting.executeScript({
-      target: { tabId: chatTab.id },
-      files: ['content/chatgpt.js']
-    });
-
-    const res = await chrome.tabs.sendMessage(chatTab.id, {
-      type: 'INJECT_TO_CHATGPT',
-      fullText,
-      autoSend: chkAutoSendChatGPT.checked
-    });
+    // Target the frame that actually shows the composer (hidden editors in other frames must not win)
+    const composerFrame = await waitForChatGPTComposer(chatTab.id);
+    const res = await chrome.tabs.sendMessage(
+      chatTab.id,
+      {
+        type: 'INJECT_TO_CHATGPT',
+        fullText,
+        autoSend: chkAutoSendChatGPT.checked,
+        targeted: true
+      },
+      { frameId: composerFrame?.frameId ?? 0 }
+    );
+    if (res && typeof res === 'object') res.composerFrame = composerFrame?.frameId ?? 0;
+    if (res && typeof res === 'object' && composerFrame?.frames) res.composerFrames = composerFrame.frames;
 
     let tabInfo = null;
     try {
@@ -1905,6 +1926,8 @@ btnSendToChatGPT.addEventListener('click', async () => {
         ok: res?.ok,
         method: res?.method,
         sent: res?.sent,
+        composerFrame: res?.composerFrame,
+        composerFrames: res?.composerFrames,
         attempts: res?.attempts,
         warning: res?.warning,
         error: res?.error,

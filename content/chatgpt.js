@@ -21,14 +21,40 @@
 
   let monitorState = null;
 
+  function isElementVisible(el) {
+    if (!el || !el.isConnected) return false;
+    if (el.closest('[aria-hidden="true"], [hidden], [inert]')) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const style = window.getComputedStyle(el);
+    return style.visibility !== 'hidden' && style.display !== 'none';
+  }
+
+  const PROMPT_INPUT_SELECTORS = [
+    '#prompt-textarea',
+    'div[contenteditable="true"][id="prompt-textarea"]',
+    'textarea[name="prompt-textarea"]',
+    'main form div[contenteditable="true"]',
+    'main div.ProseMirror[contenteditable="true"]',
+    'main div[contenteditable="true"][data-composer-markdown], main div[contenteditable="true"][role="textbox"]',
+    'div.ProseMirror[contenteditable="true"]',
+    'main textarea'
+  ];
+
+  // Prefer a VISIBLE composer: hidden/stale editors (previous conversation, other panes) must not win
   function findPromptInput() {
-    return (
-      document.querySelector('#prompt-textarea') ||
-      document.querySelector('div[contenteditable="true"][id="prompt-textarea"]') ||
-      document.querySelector('textarea[name="prompt-textarea"]') ||
-      document.querySelector('main form div[contenteditable="true"]') ||
-      document.querySelector('main textarea')
-    );
+    let firstAny = null;
+    for (const sel of PROMPT_INPUT_SELECTORS) {
+      let list = [];
+      try {
+        list = Array.from(document.querySelectorAll(sel));
+      } catch (_) {}
+      for (const el of list) {
+        if (!firstAny) firstAny = el;
+        if (isElementVisible(el)) return el;
+      }
+    }
+    return firstAny;
   }
 
   function findSendButton() {
@@ -1279,12 +1305,30 @@
   function startMonitor(job) {
     stopMonitor();
     setPromptAnchors(job.promptHead, job.promptTail);
+
+    // Each frame measures its OWN baseline at start (not resume): an iframe still showing the previous
+    // conversation must not have its old reply mistaken for the new one.
+    let baselineTurnCount = Number(job.baselineTurnCount) || 0;
+    let baselineSignature = job.baselineSignature || '';
+    let baselineCanvasSignature = job.baselineCanvasSignature || '';
+    if (!job.resume) {
+      try {
+        const turns = getAssistantTurns();
+        const nonEmpty = turns.filter((t) => (t.innerText || '').trim().length > 0);
+        baselineTurnCount = Math.max(baselineTurnCount, turns.length);
+        const localSig = buildTurnSignature(nonEmpty[nonEmpty.length - 1]);
+        if (localSig) baselineSignature = localSig;
+        const canvasSig = buildTurnSignature(findCanvasEditorRoot());
+        if (canvasSig) baselineCanvasSignature = canvasSig;
+      } catch (_) {}
+    }
+
     monitorState = {
       jobId: job.jobId,
       articleId: job.articleId,
-      baselineTurnCount: Number(job.baselineTurnCount) || 0,
-      baselineSignature: job.baselineSignature || '',
-      baselineCanvasSignature: job.baselineCanvasSignature || '',
+      baselineTurnCount,
+      baselineSignature,
+      baselineCanvasSignature,
       expectedImgIds: Array.isArray(job.expectedImgIds) ? job.expectedImgIds : [],
       expectedMinLength: Number(job.expectedMinLength) || 0,
       resume: Boolean(job.resume),
@@ -1308,8 +1352,11 @@
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === 'INJECT_TO_CHATGPT') {
-      // Only the frame that owns the composer answers; others stay silent so the right response wins
-      if (!findPromptInput()) return false;
+      // Only a frame with a VISIBLE composer answers (unless explicitly targeted); hidden editors in
+      // other frames must not swallow the prompt
+      const inputForInject = findPromptInput();
+      if (!inputForInject) return false;
+      if (!message.targeted && !isElementVisible(inputForInject)) return false;
       setPromptAnchors(String(message.fullText || '').slice(0, 80), String(message.fullText || '').slice(-60));
       injectPromptToChatGPT(message.fullText, message.autoSend)
         .then((res) => sendResponse(res))
@@ -1368,7 +1415,15 @@
     }
 
     if (message?.type === 'CHATGPT_COMPOSER_READY') {
-      sendResponse({ ok: true, ready: Boolean(findPromptInput()), readyState: document.readyState, isTop: IS_TOP_FRAME });
+      const input = findPromptInput();
+      sendResponse({
+        ok: true,
+        ready: Boolean(input),
+        visible: Boolean(input && isElementVisible(input)),
+        readyState: document.readyState,
+        isTop: IS_TOP_FRAME,
+        href: location.href
+      });
       return true;
     }
 
