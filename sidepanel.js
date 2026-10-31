@@ -1507,6 +1507,25 @@ function getExpectedImgIds(article) {
   return (article?.images || []).map((img, idx) => sanitizeImageId(img.id, idx + 1));
 }
 
+function currentPromptHead() {
+  const prompt = (textareaPrompt.value || '').trim() || DEFAULT_PROMPT;
+  return prompt.slice(0, 80);
+}
+
+// Head/tail of the exact text we send to ChatGPT; the content script uses them to find our own turn
+function currentPromptAnchors() {
+  let full = null;
+  try {
+    full = buildFullPromptText();
+  } catch (_) {
+    full = null;
+  }
+  return {
+    promptHead: currentPromptHead(),
+    promptTail: full ? full.slice(-60) : ''
+  };
+}
+
 async function requestStartMonitor(chatTab, injectRes) {
   if (!currentArticle) return null;
   const res = await sendToBackground({
@@ -1514,6 +1533,7 @@ async function requestStartMonitor(chatTab, injectRes) {
     tabId: chatTab.id,
     articleId: currentArticle.id,
     articleTitle: currentArticle.title || '',
+    ...currentPromptAnchors(),
     conversationUrl: injectRes?.conversationUrl || '',
     baselineTurnCount: Number(injectRes?.baselineTurnCount) || 0,
     baselineSignature: injectRes?.baselineSignature || '',
@@ -1661,6 +1681,10 @@ function validateTranslationCandidate(candidate, article) {
 
   if (md.length < 80) problems.push(`內容過短（僅 ${md.length} 字）`);
   if (raw && md === raw) problems.push('內容與原文完全相同');
+  const head = currentPromptHead().replace(/\s+/g, ' ').trim().slice(0, 40);
+  if (head.length >= 15 && md.replace(/\s+/g, ' ').includes(head)) {
+    problems.push('內容包含您送出的 Prompt 本身，看起來抓到的是使用者訊息而非 ChatGPT 回覆');
+  }
   const minLen = computeExpectedMinLength(article);
   if (minLen && md.length < minLen) {
     problems.push(`長度 ${md.length} 字遠低於原文預期（至少約 ${minLen} 字）`);
@@ -1696,7 +1720,7 @@ async function extractFromChatGPTTab(tabId) {
     target: { tabId },
     files: ['content/chatgpt.js']
   });
-  return chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_FROM_CHATGPT' });
+  return chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_FROM_CHATGPT', ...currentPromptAnchors() });
 }
 
 // Automatically pull translation from an open ChatGPT tab if the article has no saved translation yet
@@ -1889,7 +1913,10 @@ btnCaptureFromChatGPT.addEventListener('click', async () => {
 
     // Record what the page looked like so selector drift can be fixed from the diagnostics log
     try {
-      const probeRes = await chrome.tabs.sendMessage(chatTab.id, { type: 'CHATGPT_DOM_PROBE' });
+      const probeRes = await chrome.tabs.sendMessage(chatTab.id, {
+        type: 'CHATGPT_DOM_PROBE',
+        ...currentPromptAnchors()
+      });
       sendToBackground({
         type: 'M2H_LOG',
         level: res?.ok ? 'info' : 'error',

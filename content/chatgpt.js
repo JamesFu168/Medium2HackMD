@@ -13,7 +13,7 @@
   // Time-based (not tick-based) so background-tab timer throttling cannot shorten the wait
   const STABLE_MS = 9000; // 內容連續 9 秒完全不變且至少觀察 2 次才視為完成
   const INVALID_STABLE_MS = 60000; // 內容穩定但未通過檢查時，最多再等 60 秒
-  const STALE_STREAMING_MS = 90000; // 串流指示器持續存在但內容 90 秒毫無變化 → 視為指示器誤判
+  const STALE_STREAMING_MS = 30000; // 串流指示器持續存在但內容 30 秒毫無變化 → 視為指示器誤判
   const DEFAULT_MAX_WAIT_MS = 15 * 60 * 1000;
   const PROGRESS_THROTTLE_MS = 2500;
   const THINKING_RE =
@@ -142,6 +142,199 @@
 
   // Which selector strategy found the assistant turns (for diagnostics)
   let lastTurnStrategy = '';
+  // First ~80 / last ~60 chars of the prompt we injected; lets us locate our own user turn without selectors
+  let activePromptHead = '';
+  let activePromptTail = '';
+
+  function setPromptAnchors(head, tail) {
+    if (head) activePromptHead = String(head).slice(0, 120);
+    if (tail) activePromptTail = String(tail).slice(-120);
+  }
+
+  function normText(s) {
+    return (s || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function getComposerRoot() {
+    const input = findPromptInput();
+    return (input && (input.closest(COMPOSER_ANCESTOR_SELECTOR) || input.parentElement)) || null;
+  }
+
+  // querySelectorAll that also descends into open shadow roots and same-origin iframes
+  function deepQuerySelectorAll(selector, root = document, depth = 0) {
+    const out = [];
+    if (!root || depth > 4) return out;
+    try {
+      out.push(...root.querySelectorAll(selector));
+    } catch (_) {}
+    let hosts = [];
+    try {
+      hosts = Array.from(root.querySelectorAll('*')).filter((el) => el.shadowRoot);
+    } catch (_) {}
+    for (const host of hosts) out.push(...deepQuerySelectorAll(selector, host.shadowRoot, depth + 1));
+    let frames = [];
+    try {
+      frames = Array.from(root.querySelectorAll('iframe'));
+    } catch (_) {}
+    for (const f of frames) {
+      try {
+        if (f.contentDocument) out.push(...deepQuerySelectorAll(selector, f.contentDocument, depth + 1));
+      } catch (_) {}
+    }
+    return out;
+  }
+
+  const ASSISTANT_SR_RE = /^(ChatGPT|Assistant|助理|助手)\s*(said|says|說|说|回覆|回复)/i;
+  const USER_SR_RE = /^(You|你|您)\s*(said|說|说)/i;
+
+  // Screen-reader headings ("ChatGPT 說：" / "ChatGPT said:") precede each assistant message
+  function turnsBySrHeading() {
+    const candidates = deepQuerySelectorAll('h1, h2, h3, h4, h5, h6, [class*="sr-only"], [class*="visually-hidden"]');
+    const turns = [];
+    for (const h of candidates) {
+      const txt = normText(h.textContent);
+      if (txt.length > 40 || !ASSISTANT_SR_RE.test(txt)) continue;
+      // The turn container is the first ancestor that holds more than just the heading
+      let container = h.parentElement;
+      while (container && normText(container.textContent).length <= txt.length + 5 && container.parentElement) {
+        container = container.parentElement;
+      }
+      if (container && !isInsideComposer(container) && !turns.includes(container)) turns.push(container);
+    }
+    return turns;
+  }
+
+  const isBoundary = (el) => !el || el === document.body || el === document.documentElement || el.tagName === 'MAIN';
+
+  // From the element holding the start of our prompt, climb to the block that holds the WHOLE user
+  // turn (it must contain the prompt tail too), then unwrap pure wrapper levels so that the block's
+  // siblings are the other turns of the conversation.
+  function findUserTurnBlock(startEl, composer) {
+    const tail = normText(activePromptTail).slice(-40);
+    let block = startEl;
+    let tailFound = false;
+    if (tail.length >= 15) {
+      while (block && !isBoundary(block.parentElement) && !normText(block.textContent).includes(tail)) {
+        block = block.parentElement;
+      }
+      tailFound = Boolean(block && normText(block.textContent).includes(tail));
+    }
+    if (!tailFound) {
+      // Tail unknown or not rendered (collapsed long message): a single paragraph is never a whole
+      // turn, so climb until the block has some bulk
+      block = startEl;
+      while (block && !isBoundary(block.parentElement) && normText(block.textContent).length < 300) {
+        block = block.parentElement;
+      }
+    }
+    // Unwrap: while the parent has no other text-bearing children, the parent is still "our turn"
+    while (block && !isBoundary(block.parentElement)) {
+      const parent = block.parentElement;
+      const textSiblings = Array.from(parent.children).filter(
+        (c) => c !== block && normText(c.textContent).length > 0 && !(composer && composer.contains(c))
+      );
+      if (textSiblings.length > 0) break;
+      block = parent;
+    }
+    return block;
+  }
+
+  // Find the block that renders our own (most recent) user turn, or null
+  function findOurUserTurnBlock() {
+    const head = normText(activePromptHead).slice(0, 40);
+    if (head.length < 15) return null;
+    const composer = getComposerRoot();
+    const roots = [document];
+    // Also search shadow roots / same-origin iframes
+    for (const host of deepQuerySelectorAll('*').filter((el) => el.shadowRoot)) roots.push(host.shadowRoot);
+
+    let anchorText = null;
+    for (const root of roots) {
+      let walker;
+      try {
+        walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      } catch (_) {
+        continue;
+      }
+      let node;
+      while ((node = walker.nextNode())) {
+        if (!node.nodeValue || node.nodeValue.length < 15) continue;
+        if (!normText(node.nodeValue).includes(head)) continue;
+        const parent = node.parentElement;
+        if (!parent || isInsideComposer(parent) || (composer && composer.contains(parent))) continue;
+        const tag = parent.tagName.toLowerCase();
+        if (['script', 'style', 'title', 'textarea'].includes(tag)) continue;
+        anchorText = node; // keep the LAST occurrence (most recent send)
+      }
+    }
+    if (!anchorText) return null;
+    return findUserTurnBlock(anchorText.parentElement, composer) || null;
+  }
+
+  // Locate our own prompt text in the transcript; the next text block after it is the reply.
+  function turnsByPromptAnchor() {
+    const head = normText(activePromptHead).slice(0, 40);
+    const composer = getComposerRoot();
+    const block = findOurUserTurnBlock();
+    if (!block) return [];
+
+    // Reply = following siblings of our user turn that carry text and are not another copy of our prompt
+    const replies = [];
+    let sib = block.nextElementSibling;
+    while (sib) {
+      const txt = normText(sib.textContent);
+      if (txt.length > 0 && !txt.includes(head) && !(composer && composer.contains(sib))) replies.push(sib);
+      sib = sib.nextElementSibling;
+    }
+    if (replies.length === 0) return [];
+    // Collapse consecutive sibling blocks into one logical turn container (the last one is newest)
+    return [replies[replies.length - 1]];
+  }
+
+  // The transcript list: shallowest container (outside the composer) with >= 2 text-bearing children
+  // that holds (almost) all of the transcript text. When our own user turn is known, the list must
+  // contain it as a descendant (and not be inside it), which rules out paragraph containers.
+  function findTranscriptList(userBlock = null) {
+    const main = document.querySelector('main');
+    if (!main) return null;
+    const composer = getComposerRoot();
+    const walker = document.createTreeWalker(main, NodeFilter.SHOW_ELEMENT);
+    let el;
+    let guard = 0;
+    const candidates = [];
+    while ((el = walker.nextNode()) && guard++ < 6000) {
+      if (composer && (el === composer || composer.contains(el))) continue;
+      if (userBlock && (el === userBlock || userBlock.contains(el) || !el.contains(userBlock))) continue;
+      const kids = Array.from(el.children).filter(
+        (c) => !(composer && composer.contains(c)) && normText(c.textContent).length > 0
+      );
+      if (kids.length < 2) continue;
+      candidates.push({ el, kids, len: normText(el.textContent).length });
+    }
+    const maxLen = candidates.reduce((m, c) => Math.max(m, c.len), 0);
+    // Pre-order walk => the first qualifying candidate is the shallowest
+    return candidates.find((c) => c.len >= maxLen * 0.9) || null;
+  }
+
+  // Last resort: the last block of the transcript list, provided it comes after our own user turn
+  // (needed when ChatGPT turned a long paste into an attachment chip, so no prompt text is in the DOM).
+  // Length / placeholder validation downstream guards against grabbing a tiny user chip.
+  function turnsByTranscriptLast() {
+    const userBlock = findOurUserTurnBlock();
+    const list = findTranscriptList(userBlock);
+    if (!list) return [];
+    const head = normText(activePromptHead).slice(0, 40);
+    const last = list.kids[list.kids.length - 1];
+    if (!last) return [];
+    if (head.length >= 15 && normText(last.textContent).includes(head)) return []; // still our prompt
+    if (isUserTurn(last)) return [];
+    if (userBlock) {
+      if (last === userBlock || userBlock.contains(last) || last.contains(userBlock)) return [];
+      // must come after our turn in document order
+      if (!(userBlock.compareDocumentPosition(last) & Node.DOCUMENT_POSITION_FOLLOWING)) return [];
+    }
+    return [last];
+  }
 
   function getAssistantTurns() {
     const strategies = [
@@ -166,7 +359,11 @@
           Array.from(document.querySelectorAll('main .markdown, main .prose, main [data-message-id]')).filter(
             (el) => !isUserTurn(el) && !isInsideComposer(el) && !el.closest('.markdown .markdown, .prose .prose')
           )
-      ]
+      ],
+      ['role-deep', () => deepQuerySelectorAll('[data-message-author-role="assistant"], [data-turn="assistant"]')],
+      ['sr-heading', turnsBySrHeading],
+      ['prompt-anchor', turnsByPromptAnchor],
+      ['transcript-last', turnsByTranscriptLast]
     ];
 
     for (const [name, fn] of strategies) {
@@ -186,6 +383,13 @@
   }
 
   const NON_STREAM_LABEL_RE = /voice|語音|dictat|聽寫|record|錄音|錄製|speech|microphone|麥克風|video|影片|share|分享/i;
+  const SEND_LABEL_RE = /^(send|傳送|發送|送出|提交)/i;
+
+  function isSendLikeButton(b) {
+    const label = b.getAttribute('aria-label') || '';
+    const testid = b.getAttribute('data-testid') || '';
+    return /send-button|composer-send/i.test(testid) || SEND_LABEL_RE.test(label.trim());
+  }
 
   // Returns the matched indicator (string) or '' when nothing suggests ChatGPT is still generating
   function getStreamingIndicator() {
@@ -204,12 +408,14 @@
         if (document.querySelector(sel)) return sel;
       } catch (_) {}
     }
-    // Generic: a Stop button, but only inside the composer area and not a voice/recording control
-    const buttons = Array.from(document.querySelectorAll('button[aria-label*="Stop" i], button[aria-label*="停止"], button[aria-label*="中止"]'));
-    for (const b of buttons) {
+    // Generic: a Stop button inside the composer, not a voice control, and only while no send button
+    // is offered (some UIs keep a permanent "停止" control, e.g. for voice, next to the composer)
+    const composerButtons = Array.from(document.querySelectorAll('button')).filter((b) => isInsideComposer(b));
+    if (composerButtons.some(isSendLikeButton)) return '';
+    for (const b of composerButtons) {
       const label = b.getAttribute('aria-label') || '';
-      if (NON_STREAM_LABEL_RE.test(label)) continue;
-      if (isInsideComposer(b)) return `composer:${label}`;
+      if (!/stop|停止|中止/i.test(label) || NON_STREAM_LABEL_RE.test(label)) continue;
+      return `composer:${label}`;
     }
     return '';
   }
@@ -239,29 +445,71 @@
       len: (el.innerText || '').length
     });
     const main = document.querySelector('main');
+    const composer = getComposerRoot();
+    const input = findPromptInput();
     const mainChildren = main ? Array.from(main.querySelectorAll('article, [data-testid^="conversation-turn"], [data-message-id], [data-turn]')).slice(-4) : [];
+    const describeBtn = (b) => ({
+      testid: b.getAttribute('data-testid') || undefined,
+      aria: b.getAttribute('aria-label') || undefined,
+      id: b.id || undefined,
+      text: normText(b.textContent).slice(0, 20) || undefined,
+      disabled: Boolean(b.disabled)
+    });
+    const composerButtons = composer ? Array.from(composer.querySelectorAll('button')).slice(0, 14).map(describeBtn) : [];
     const stopLike = Array.from(document.querySelectorAll('button'))
       .filter((b) => /stop|停止|中止/i.test(b.getAttribute('aria-label') || '') || /stop/i.test(b.getAttribute('data-testid') || ''))
       .slice(0, 5)
-      .map((b) => ({
-        testid: b.getAttribute('data-testid') || undefined,
-        aria: b.getAttribute('aria-label') || undefined,
-        id: b.id || undefined,
-        inComposer: isInsideComposer(b)
-      }));
-    const submitLike = Array.from(document.querySelectorAll('button[data-testid*="send"], button[data-testid*="submit"], #composer-submit-button, form button[type="submit"]'))
-      .slice(0, 5)
-      .map((b) => ({
-        testid: b.getAttribute('data-testid') || undefined,
-        aria: b.getAttribute('aria-label') || undefined,
-        id: b.id || undefined,
-        disabled: Boolean(b.disabled)
-      }));
+      .map((b) => ({ ...describeBtn(b), inComposer: isInsideComposer(b) }));
+
+    let list = null;
+    try {
+      list = findTranscriptList(findOurUserTurnBlock());
+    } catch (_) {
+      list = null;
+    }
+    const outline = list
+      ? {
+          container: describe(list.el),
+          children: list.kids.slice(-4).map((k) => ({ ...describe(k), head: normText(k.textContent).slice(0, 40) }))
+        }
+      : null;
+
+    // Our own user turn (located by prompt head/tail) and what follows it
+    let anchor = null;
+    try {
+      const head = normText(activePromptHead).slice(0, 40);
+      if (head.length >= 15) {
+        const walker = document.createTreeWalker(main || document.body, NodeFilter.SHOW_TEXT);
+        let node;
+        let found = null;
+        while ((node = walker.nextNode())) {
+          if (node.nodeValue && node.nodeValue.length >= 15 && normText(node.nodeValue).includes(head) && !isInsideComposer(node.parentElement)) found = node;
+        }
+        if (found) {
+          const block = findUserTurnBlock(found.parentElement, composer);
+          anchor = {
+            textParent: describe(found.parentElement),
+            userTurnBlock: block ? describe(block) : null,
+            parent: block?.parentElement ? describe(block.parentElement) : null,
+            following: block ? Array.from(block.parentElement?.children || []).filter((c) => c.compareDocumentPosition(block) & Node.DOCUMENT_POSITION_PRECEDING).slice(0, 3).map((c) => ({ ...describe(c), head: normText(c.textContent).slice(0, 40) })) : []
+          };
+        }
+      }
+    } catch (err) {
+      anchor = { error: err?.message || String(err) };
+    }
+
+    const srHeadings = deepQuerySelectorAll('[class*="sr-only"], [class*="visually-hidden"], h5, h6')
+      .map((h) => normText(h.textContent))
+      .filter((t) => t && t.length <= 40)
+      .slice(0, 8);
+
     return {
       href: location.href,
       title: (document.title || '').slice(0, 60),
       hasMain: Boolean(main),
       turnStrategy: lastTurnStrategy,
+      promptHead: activePromptHead.slice(0, 30) || undefined,
       streamingMatch: getStreamingIndicator(),
       counts: {
         role: q('[data-message-author-role]'),
@@ -272,11 +520,18 @@
         markdown: q('.markdown'),
         prose: q('.prose'),
         agentTurn: q('.agent-turn'),
-        prompt: q('#prompt-textarea')
+        prompt: q('#prompt-textarea'),
+        shadowHosts: deepQuerySelectorAll('*').filter((el) => el.shadowRoot).length,
+        iframes: q('iframe')
       },
-      lastTurnLike: mainChildren.map(describe),
+      input: input ? describe(input) : null,
+      composer: composer ? describe(composer) : null,
+      composerButtons,
       stopLike,
-      submitLike
+      lastTurnLike: mainChildren.map(describe),
+      outline,
+      anchor,
+      srHeadings
     };
   }
 
@@ -505,6 +760,7 @@
 
       const tag = node.tagName.toLowerCase();
       if (['button', 'svg', 'style', 'script'].includes(tag)) return '';
+      if (typeof node.className === 'string' && /sr-only|visually-hidden/.test(node.className)) return '';
       if (tag === 'br') return '\n';
 
       if (tag === 'code' && (!node.parentElement || node.parentElement.tagName.toLowerCase() !== 'pre')) {
@@ -549,6 +805,7 @@
 
       const tag = node.tagName.toLowerCase();
       if (['button', 'svg', 'style', 'script'].includes(tag)) return;
+      if (typeof node.className === 'string' && /sr-only|visually-hidden/.test(node.className)) return;
 
       if (/^h[1-6]$/.test(tag)) {
         const level = parseInt(tag[1], 10);
@@ -743,6 +1000,10 @@
     }
     if (THINKING_RE.test(md) && md.length < 400) {
       problems.push('回覆看起來仍是「思考中」的提示文字');
+    }
+    const head = normText(activePromptHead).slice(0, 40);
+    if (head.length >= 15 && normText(md).includes(head)) {
+      problems.push('抓到的內容包含您送出的 Prompt 本身，而不是 ChatGPT 的回覆');
     }
     if (typeof job.expectedMinLength === 'number' && job.expectedMinLength > 0 && md.length < job.expectedMinLength) {
       problems.push(
@@ -958,6 +1219,7 @@
 
   function startMonitor(job) {
     stopMonitor();
+    setPromptAnchors(job.promptHead, job.promptTail);
     monitorState = {
       jobId: job.jobId,
       articleId: job.articleId,
@@ -987,6 +1249,7 @@
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === 'INJECT_TO_CHATGPT') {
+      setPromptAnchors(String(message.fullText || '').slice(0, 80), String(message.fullText || '').slice(-60));
       injectPromptToChatGPT(message.fullText, message.autoSend)
         .then((res) => sendResponse(res))
         .catch((err) => sendResponse({ ok: false, error: err.message }));
@@ -995,6 +1258,7 @@
 
     if (message?.type === 'EXTRACT_FROM_CHATGPT') {
       try {
+        setPromptAnchors(message.promptHead, message.promptTail);
         const res = extractLatestAssistantMarkdown();
         sendResponse(res);
       } catch (err) {
@@ -1048,6 +1312,7 @@
 
     if (message?.type === 'CHATGPT_DOM_PROBE') {
       try {
+        setPromptAnchors(message.promptHead, message.promptTail);
         const res = extractLatestAssistantMarkdown();
         sendResponse({ ok: true, probe: domProbe(), extract: { ...res, markdown: (res.markdown || '').slice(0, 200) } });
       } catch (err) {
