@@ -11,7 +11,8 @@
     "storage",
     "clipboardWrite",
     "clipboardRead",
-    "alarms"
+    "alarms",
+    "webNavigation"
   ],
   "host_permissions": [
     "https://medium.com/*",

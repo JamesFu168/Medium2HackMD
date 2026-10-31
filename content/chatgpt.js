@@ -32,15 +32,26 @@
   }
 
   function findSendButton() {
-    return (
+    const direct =
       document.querySelector('button[data-testid="send-button"]') ||
       document.querySelector('button#composer-submit-button') ||
       document.querySelector('button[data-testid="composer-send-button"]') ||
       document.querySelector('button[aria-label="Send prompt"]') ||
       document.querySelector('button[aria-label="傳送提示"]') ||
       document.querySelector('button[aria-label="發送提示"]') ||
-      document.querySelector('form button[type="submit"]')
-    );
+      document.querySelector('form button[type="submit"]');
+    if (direct) return direct;
+
+    // Unknown markup: any send-like button inside the composer area
+    const composer = getComposerRoot();
+    if (!composer) return null;
+    const buttons = Array.from(composer.querySelectorAll('button'));
+    const sendLike = buttons.filter((b) => {
+      const label = `${b.getAttribute('aria-label') || ''} ${b.getAttribute('title') || ''} ${normText(b.textContent)}`;
+      if (/stop|停止|中止|voice|語音|dictat|聽寫|record|錄音|attach|附加|上傳|upload|plus|更多|more|工具|tool/i.test(label)) return false;
+      return /send|submit|傳送|發送|送出|提交/i.test(label) || b.getAttribute('type') === 'submit';
+    });
+    return sendLike.find((b) => !b.disabled) || sendLike[0] || null;
   }
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -155,10 +166,26 @@
     return (s || '').replace(/\s+/g, ' ').trim();
   }
 
+  // The composer = smallest ancestor of the prompt input that also contains its action buttons
   function getComposerRoot() {
     const input = findPromptInput();
-    return (input && (input.closest(COMPOSER_ANCESTOR_SELECTOR) || input.parentElement)) || null;
+    if (!input) return null;
+    let el = input.parentElement;
+    let hops = 0;
+    while (el && el.tagName !== 'MAIN' && el !== document.body && hops++ < 12) {
+      if (el.querySelector('button')) return el;
+      el = el.parentElement;
+    }
+    return input.closest(COMPOSER_ANCESTOR_SELECTOR) || input.parentElement;
   }
+
+  const IS_TOP_FRAME = (() => {
+    try {
+      return window.top === window;
+    } catch (_) {
+      return false;
+    }
+  })();
 
   // querySelectorAll that also descends into open shadow roots and same-origin iframes
   function deepQuerySelectorAll(selector, root = document, depth = 0) {
@@ -295,7 +322,7 @@
   // that holds (almost) all of the transcript text. When our own user turn is known, the list must
   // contain it as a descendant (and not be inside it), which rules out paragraph containers.
   function findTranscriptList(userBlock = null) {
-    const main = document.querySelector('main');
+    const main = document.querySelector('main') || (IS_TOP_FRAME ? null : document.body);
     if (!main) return null;
     const composer = getComposerRoot();
     const walker = document.createTreeWalker(main, NodeFilter.SHOW_ELEMENT);
@@ -326,6 +353,7 @@
     const head = normText(activePromptHead).slice(0, 40);
     const last = list.kids[list.kids.length - 1];
     if (!last) return [];
+    if (normText(last.textContent).length < 80) return []; // footers / disclaimers are never a reply
     if (head.length >= 15 && normText(last.textContent).includes(head)) return []; // still our prompt
     if (isUserTurn(last)) return [];
     if (userBlock) {
@@ -504,8 +532,31 @@
       .filter((t) => t && t.length <= 40)
       .slice(0, 8);
 
+    const iframes = Array.from(document.querySelectorAll('iframe')).slice(0, 6).map((f) => {
+      let accessible = false;
+      let innerLen = 0;
+      try {
+        accessible = Boolean(f.contentDocument);
+        innerLen = accessible ? normText(f.contentDocument.body?.textContent).length : 0;
+      } catch (_) {
+        accessible = false;
+      }
+      return {
+        src: (f.getAttribute('src') || '').slice(0, 120) || undefined,
+        name: f.getAttribute('name') || undefined,
+        title: f.getAttribute('title') || undefined,
+        accessible,
+        innerLen,
+        w: f.clientWidth,
+        h: f.clientHeight
+      };
+    });
+
     return {
       href: location.href,
+      isTop: IS_TOP_FRAME,
+      bodyLen: normText(document.body?.textContent).length,
+      iframes,
       title: (document.title || '').slice(0, 60),
       hasMain: Boolean(main),
       turnStrategy: lastTurnStrategy,
@@ -1049,7 +1100,9 @@
       elapsedMs: now - st.startedAt,
       note: detail.note || '',
       diag: detail.diag || null,
-      hidden: document.visibilityState === 'hidden'
+      hidden: document.visibilityState === 'hidden',
+      isTop: IS_TOP_FRAME,
+      frameHref: location.href
     }).then((res) => {
       // Background no longer knows this job (cancelled / dismissed): stop polling
       if (res && res.stop && monitorState && monitorState.jobId === st.jobId) {
@@ -1201,14 +1254,20 @@
         return;
       }
 
-      // Content is stable but fails checks: keep waiting a bit in case ChatGPT is still working
-      // (e.g. stop button selector broke, or it will continue after a pause), then give up with reason.
-      if (stableMs >= INVALID_STABLE_MS) {
-        finishMonitorFailure(
-          `ChatGPT 回覆已停止變化，但內容未通過檢查：${validation.problems.join('；')}。未自動存入 Library，請檢查 ChatGPT 頁面；若確認內容正確，可按「立即從 ChatGPT 擷取回覆」強制存入。`,
-          { candidateChars: res.markdown.length }
-        );
-        return;
+      // Content is stable but fails checks. This frame keeps watching (another frame of the same tab
+      // may hold the real transcript); the background decides whether the whole job has failed.
+      if (stableMs >= INVALID_STABLE_MS && Date.now() - (st.lastInvalidReportAt || 0) > INVALID_STABLE_MS) {
+        st.lastInvalidReportAt = Date.now();
+        sendToBackground({
+          type: 'CHATGPT_MONITOR_INVALID',
+          jobId: st.jobId,
+          articleId: st.articleId,
+          reason: `ChatGPT 回覆已停止變化，但內容未通過檢查：${validation.problems.join('；')}。未自動存入 Library，請檢查 ChatGPT 頁面；若確認內容正確，可按「立即從 ChatGPT 擷取回覆」強制存入。`,
+          candidateChars: res.markdown.length,
+          conversationUrl: location.href
+        }).then((r) => {
+          if (r && r.stop && monitorState && monitorState.jobId === st.jobId) stopMonitor();
+        });
       }
       reportProgress('verifying', { chars, note: validation.problems[0] || '', diag });
     } catch (err) {
@@ -1249,6 +1308,8 @@
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === 'INJECT_TO_CHATGPT') {
+      // Only the frame that owns the composer answers; others stay silent so the right response wins
+      if (!findPromptInput()) return false;
       setPromptAnchors(String(message.fullText || '').slice(0, 80), String(message.fullText || '').slice(-60));
       injectPromptToChatGPT(message.fullText, message.autoSend)
         .then((res) => sendResponse(res))
@@ -1300,13 +1361,30 @@
         articleId: monitorState?.articleId || null,
         chars: monitorState?.lastMarkdown?.length || 0,
         hidden: document.visibilityState === 'hidden',
+        isTop: IS_TOP_FRAME,
         conversationUrl: location.href
       });
       return true;
     }
 
     if (message?.type === 'CHATGPT_COMPOSER_READY') {
-      sendResponse({ ok: true, ready: Boolean(findPromptInput()), readyState: document.readyState });
+      sendResponse({ ok: true, ready: Boolean(findPromptInput()), readyState: document.readyState, isTop: IS_TOP_FRAME });
+      return true;
+    }
+
+    if (message?.type === 'CHATGPT_FRAME_INFO') {
+      let turns = 0;
+      try {
+        turns = getAssistantTurns().length;
+      } catch (_) {}
+      sendResponse({
+        ok: true,
+        isTop: IS_TOP_FRAME,
+        href: location.href,
+        hasComposer: Boolean(findPromptInput()),
+        turns,
+        bodyLen: normText(document.body?.textContent).length
+      });
       return true;
     }
 

@@ -147,41 +147,86 @@ function unwrapOuterMarkdownFence(text) {
 
 // ==================== Monitor control inside the ChatGPT tab ====================
 
-async function pingTabMonitor(tabId) {
+// ChatGPT may render the transcript inside an iframe, so the monitor runs in EVERY frame of the tab
+// and the background accepts the finished translation from whichever frame finds it.
+
+function buildStartPayload(job, resume) {
+  return {
+    jobId: job.jobId,
+    articleId: job.articleId,
+    baselineTurnCount: resume ? 0 : job.baselineTurnCount,
+    baselineSignature: resume ? '' : job.baselineSignature,
+    baselineCanvasSignature: resume ? '' : job.baselineCanvasSignature,
+    promptHead: job.promptHead || '',
+    promptTail: job.promptTail || '',
+    expectedImgIds: job.expectedImgIds,
+    expectedMinLength: job.expectedMinLength,
+    startedAt: job.startedAt,
+    maxWaitMs: JOB_MAX_WAIT_MS,
+    resume
+  };
+}
+
+async function injectIntoFrames(tabId, frameIds = null) {
+  const target = frameIds ? { tabId, frameIds } : { tabId, allFrames: true };
+  const results = await chrome.scripting.executeScript({ target, files: ['content/chatgpt.js'] });
+  const ids = (results || []).map((r) => r.frameId).filter((id) => typeof id === 'number');
+  return ids.length ? ids : [0];
+}
+
+async function sendToFrame(tabId, frameId, message) {
   try {
-    return await chrome.tabs.sendMessage(tabId, { type: 'GET_MONITOR_STATE' });
+    return await chrome.tabs.sendMessage(tabId, message, { frameId });
   } catch (_) {
     return null;
   }
 }
 
+async function mergeFrameIds(jobId, frameIds) {
+  const job = await getJob(jobId);
+  if (!job) return;
+  const known = new Set([...(job.frameIds || []), ...frameIds]);
+  await patchJob(jobId, { frameIds: Array.from(known) });
+}
+
+// Inject into the given frames (or all) and make sure each runs the monitor for this job.
+// Frames already running it just get a forced tick (message delivery ignores timer throttling).
+async function ensureMonitorsInFrames(job, resume, reason, frameIds = null) {
+  const ids = await injectIntoFrames(job.tabId, frameIds);
+  const summary = [];
+  let running = 0;
+  for (const frameId of ids) {
+    const state = await sendToFrame(job.tabId, frameId, { type: 'MONITOR_TICK_NOW' });
+    if (state && state.active && state.jobId === job.jobId) {
+      running++;
+      summary.push({ frameId, top: state.isTop, chars: state.chars });
+      continue;
+    }
+    const res = await sendToFrame(job.tabId, frameId, {
+      type: 'START_MONITOR',
+      job: buildStartPayload(job, resume)
+    });
+    if (res && res.ok) running++;
+    summary.push({ frameId, started: Boolean(res && res.ok), error: res ? res.error : 'no response' });
+  }
+  await mergeFrameIds(job.jobId, ids);
+  logEvent(running ? 'info' : 'error', `frames ensured (${reason})`, { jobId: job.jobId, frames: summary });
+  if (running === 0) {
+    throw new Error(summary.map((s) => `frame ${s.frameId}: ${s.error || 'failed'}`).join('; ') || '無法在 ChatGPT 分頁啟動自動偵測');
+  }
+  return summary;
+}
+
 async function injectAndStartMonitor(job, resume = false) {
   logEvent('info', 'inject monitor', { jobId: job.jobId, tabId: job.tabId, resume });
-  await chrome.scripting.executeScript({
-    target: { tabId: job.tabId },
-    files: ['content/chatgpt.js']
-  });
-  const res = await chrome.tabs.sendMessage(job.tabId, {
-    type: 'START_MONITOR',
-    job: {
-      jobId: job.jobId,
-      articleId: job.articleId,
-      baselineTurnCount: resume ? 0 : job.baselineTurnCount,
-      baselineSignature: resume ? '' : job.baselineSignature,
-      baselineCanvasSignature: resume ? '' : job.baselineCanvasSignature,
-      promptHead: job.promptHead || '',
-      promptTail: job.promptTail || '',
-      expectedImgIds: job.expectedImgIds,
-      expectedMinLength: job.expectedMinLength,
-      startedAt: job.startedAt,
-      maxWaitMs: JOB_MAX_WAIT_MS,
-      resume
-    }
-  });
-  if (!res || !res.ok) {
-    throw new Error(res?.error || '無法在 ChatGPT 分頁啟動自動偵測');
+  await ensureMonitorsInFrames(job, resume, resume ? 'resume' : 'start');
+}
+
+async function stopMonitorsInTab(job) {
+  const ids = new Set([0, ...(job.frameIds || [])]);
+  for (const frameId of ids) {
+    await sendToFrame(job.tabId, frameId, { type: 'STOP_MONITOR', jobId: job.jobId });
   }
-  logEvent('info', 'monitor started in tab', { jobId: job.jobId, resume });
 }
 
 async function ensureWatchdog() {
@@ -205,6 +250,7 @@ async function failJob(jobId, reason, extra = {}) {
   });
   logEvent('error', 'job failed', { jobId, reason, ...extra });
   if (job) {
+    if (typeof job.tabId === 'number') await stopMonitorsInTab(job);
     setBadge('!', '#c62828');
     broadcast({ type: 'M2H_MONITOR_FAILED', job });
   }
@@ -238,9 +284,7 @@ async function startMonitorJob(payload) {
   const jobs = await loadJobs();
   for (const other of Object.values(jobs)) {
     if (other.status === 'pending' && other.articleId === job.articleId) {
-      try {
-        await chrome.tabs.sendMessage(other.tabId, { type: 'STOP_MONITOR', jobId: other.jobId });
-      } catch (_) {}
+      await stopMonitorsInTab(other);
       delete jobs[other.jobId];
     }
   }
@@ -273,11 +317,7 @@ async function startMonitorJob(payload) {
 async function cancelMonitorJob(jobId, silent = false) {
   const job = await getJob(jobId);
   if (!job) return;
-  if (typeof job.tabId === 'number') {
-    try {
-      await chrome.tabs.sendMessage(job.tabId, { type: 'STOP_MONITOR', jobId });
-    } catch (_) {}
-  }
+  if (typeof job.tabId === 'number') await stopMonitorsInTab(job);
   await removeJob(jobId);
   setBadge('');
   logEvent('info', 'job cancelled', { jobId });
@@ -293,6 +333,8 @@ async function handleTranslationReady(message, sender) {
     chars: (message.markdown || '').length,
     source: message.source,
     senderTab: sender?.tab?.id,
+    frameId: sender?.frameId,
+    frameHref: message.conversationUrl,
     jobStatus: job?.status || 'missing'
   });
   if (!job || job.status !== 'pending') {
@@ -339,6 +381,7 @@ async function handleTranslationReady(message, sender) {
     setBadge('✓', '#2e7d32');
     logEvent('info', 'translation saved to library', { jobId: job.jobId, articleId: article.id, chars: cleanMd.length });
     broadcast({ type: 'M2H_TRANSLATION_SAVED', job: done });
+    await stopMonitorsInTab(job); // other frames of the same tab are still polling
     return { ok: true };
   } catch (err) {
     await failJob(job.jobId, `翻譯已完成但寫入 Library 失敗：${err?.message || err}`);
@@ -389,30 +432,47 @@ async function watchdogTick() {
     }
     if (tab.status && tab.status !== 'complete') continue;
 
-    // Force a tick through messaging: hidden tabs get their timers throttled, messages don't
-    let state = null;
+    // Re-inject into all frames (idempotent), force a tick where running, start where missing.
+    // Message delivery is not subject to hidden-tab timer throttling, so this keeps things moving.
     try {
-      state = await chrome.tabs.sendMessage(job.tabId, { type: 'MONITOR_TICK_NOW' });
-    } catch (_) {
-      state = null;
-    }
-    if (state && state.active && state.jobId === job.jobId) {
-      logEvent('debug', 'watchdog tick ok', { jobId: job.jobId, chars: state.chars, hidden: state.hidden });
-      continue;
-    }
-
-    logEvent('warn', 'monitor not running in tab, re-attaching', {
-      jobId: job.jobId,
-      state: state ? { active: state.active, jobId: state.jobId } : 'no response'
-    });
-    try {
-      await injectAndStartMonitor(job, true);
-      await patchJob(job.jobId, { note: '已重新連接 ChatGPT 分頁的自動偵測' });
+      await ensureMonitorsInFrames(job, true, 'watchdog');
     } catch (err) {
-      logEvent('error', 're-attach failed', { jobId: job.jobId, error: err?.message || String(err) });
+      logEvent('error', 'watchdog re-attach failed', { jobId: job.jobId, error: err?.message || String(err) });
       await patchJob(job.jobId, { note: `重新連接失敗：${err?.message || err}` });
     }
   }
+}
+
+// Decide whether per-frame "content invalid" reports add up to a failed job
+async function handleMonitorInvalid(message, sender) {
+  const job = await getJob(message.jobId);
+  if (!job || job.status !== 'pending') return { ok: false, stop: true };
+  const frameId = typeof sender?.frameId === 'number' ? sender.frameId : 0;
+  const frameInvalid = { ...(job.frameInvalid || {}), [frameId]: { reason: message.reason, chars: Number(message.candidateChars) || 0, at: Date.now() } };
+  await patchJob(job.jobId, { frameInvalid });
+  logEvent('warn', 'frame reports invalid content', {
+    jobId: job.jobId,
+    frameId,
+    candidateChars: message.candidateChars,
+    activeFrameId: job.activeFrameId,
+    jobChars: job.chars,
+    reason: message.reason
+  });
+
+  // Another frame currently holds more content (the real transcript): ignore this frame
+  if (typeof job.activeFrameId === 'number' && job.activeFrameId !== frameId && (job.chars || 0) > (Number(message.candidateChars) || 0)) {
+    return { ok: true };
+  }
+  const frames = (job.frameIds && job.frameIds.length ? job.frameIds : [frameId]).map(Number);
+  const allInvalid = frames.every((id) => frameInvalid[id]);
+  if (frames.length <= 1 || allInvalid) {
+    await failJob(job.jobId, message.reason || '回覆內容未通過檢查', {
+      candidateChars: Number(message.candidateChars) || 0,
+      conversationUrl: message.conversationUrl || ''
+    });
+    return { ok: true, stop: true };
+  }
+  return { ok: true };
 }
 
 if (chrome.alarms) {
@@ -430,16 +490,33 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     const job = Object.values(jobs).find((j) => j.status === 'pending' && j.tabId === tabId);
     if (!job) return;
     if (!tab?.url || !/^https:\/\/(chatgpt\.com|chat\.openai\.com)\//.test(tab.url)) return;
-    const state = await pingTabMonitor(tabId);
-    if (state && state.active && state.jobId === job.jobId) return;
-    logEvent('info', 'tab finished loading without monitor, re-attaching', { jobId: job.jobId, url: tab.url });
     try {
-      await injectAndStartMonitor(job, true);
+      await ensureMonitorsInFrames(job, true, 'tab complete');
     } catch (err) {
       logEvent('error', 're-inject after reload failed', { jobId: job.jobId, error: err?.message || String(err) });
     }
   })().catch(() => {});
 });
+
+// Sub-frames (ChatGPT renders the transcript in an iframe that appears after the first message)
+if (chrome.webNavigation) {
+  chrome.webNavigation.onCompleted.addListener(
+    (details) => {
+      (async () => {
+        const jobs = await loadJobs();
+        const job = Object.values(jobs).find((j) => j.status === 'pending' && j.tabId === details.tabId);
+        if (!job) return;
+        logEvent('info', 'frame navigation completed', { jobId: job.jobId, frameId: details.frameId, url: (details.url || '').slice(0, 120) });
+        try {
+          await ensureMonitorsInFrames(job, true, `frame ${details.frameId} completed`, [details.frameId]);
+        } catch (err) {
+          logEvent('warn', 'inject into frame failed', { jobId: job.jobId, frameId: details.frameId, error: err?.message || String(err) });
+        }
+      })().catch(() => {});
+    },
+    { url: [{ hostSuffix: 'chatgpt.com' }, { hostSuffix: 'openai.com' }, { hostSuffix: 'oaiusercontent.com' }, { hostSuffix: 'oaistatic.com' }] }
+  );
+}
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   (async () => {
@@ -509,28 +586,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return { ok: false, stop: true }; // tell the tab to stop polling a dead job
           }
           const phase = message.phase || 'waiting';
-          const phaseChanged = existing.phase !== phase;
-          const lastLogAt = existing.lastLogAt || 0;
-          if (phaseChanged || Date.now() - lastLogAt > 30000) {
+          const frameId = typeof sender?.frameId === 'number' ? sender.frameId : 0;
+          const chars = Number(message.chars) || 0;
+          // The frame that has content owns the job's displayed status; empty frames only log
+          const owner = typeof existing.activeFrameId === 'number' ? existing.activeFrameId : null;
+          const takesOwnership = chars > 0 && (owner === null || chars >= (existing.chars || 0) || frameId === owner);
+          const mayUpdate = takesOwnership || owner === null || frameId === owner;
+          const phaseChanged = mayUpdate && existing.phase !== phase;
+          const lastLogKey = `lastLogAt_${frameId}`;
+          const lastLogAt = existing[lastLogKey] || 0;
+          const shouldLog = phaseChanged || Date.now() - lastLogAt > 30000;
+          if (shouldLog) {
             logEvent('debug', `progress ${phase}`, {
               jobId: message.jobId,
-              chars: message.chars,
+              frameId,
+              top: message.isTop,
+              chars,
               hidden: message.hidden,
               note: message.note || undefined,
               diag: message.diag || undefined
             });
           }
-          const job = await patchJob(message.jobId, {
-            phase,
-            chars: Number(message.chars) || 0,
-            note: message.note || '',
-            elapsedMs: Number(message.elapsedMs) || 0,
-            lastLogAt: phaseChanged || Date.now() - lastLogAt > 30000 ? Date.now() : lastLogAt
-          });
-          if (job) broadcast({ type: 'M2H_MONITOR_UPDATE', job });
+          const patch = { [lastLogKey]: shouldLog ? Date.now() : lastLogAt };
+          if (mayUpdate) {
+            Object.assign(patch, {
+              phase,
+              chars,
+              note: message.note || '',
+              elapsedMs: Number(message.elapsedMs) || 0
+            });
+            if (takesOwnership) patch.activeFrameId = frameId;
+          }
+          const job = await patchJob(message.jobId, patch);
+          if (job && mayUpdate) broadcast({ type: 'M2H_MONITOR_UPDATE', job });
           return { ok: Boolean(job) };
         })
       );
+
+    case 'CHATGPT_MONITOR_INVALID':
+      return respond(handleMonitorInvalid(message, sender));
 
     case 'CHATGPT_TRANSLATION_READY':
       return respond(handleTranslationReady(message, sender));

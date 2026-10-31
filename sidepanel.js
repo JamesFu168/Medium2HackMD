@@ -1715,12 +1715,67 @@ async function resolveChatGPTTabForArticle(articleId) {
   return { tab: tabs[0] || null, fromJob: false, ambiguous: tabs.length > 1 };
 }
 
+// ChatGPT may render the transcript inside an iframe: ask every frame and keep the best answer
 async function extractFromChatGPTTab(tabId) {
-  await chrome.scripting.executeScript({
-    target: { tabId },
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
     files: ['content/chatgpt.js']
   });
-  return chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_FROM_CHATGPT', ...currentPromptAnchors() });
+  const frameIds = (results || []).map((r) => r.frameId).filter((id) => typeof id === 'number');
+  if (frameIds.length === 0) frameIds.push(0);
+
+  const anchors = currentPromptAnchors();
+  const perFrame = [];
+  for (const frameId of frameIds) {
+    try {
+      const res = await chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_FROM_CHATGPT', ...anchors }, { frameId });
+      perFrame.push({ frameId, res });
+    } catch (err) {
+      perFrame.push({ frameId, res: { ok: false, error: err?.message || String(err) } });
+    }
+  }
+
+  const okFrames = perFrame.filter((f) => f.res && f.res.ok && f.res.markdown);
+  okFrames.sort((a, b) => (b.res.markdown.length || 0) - (a.res.markdown.length || 0));
+  const best = okFrames[0] || perFrame.find((f) => f.res) || { frameId: 0, res: { ok: false, error: '沒有任何 frame 回應' } };
+  return {
+    ...best.res,
+    frameId: best.frameId,
+    frames: perFrame.map((f) => ({
+      frameId: f.frameId,
+      ok: Boolean(f.res?.ok),
+      chars: f.res?.markdown?.length || 0,
+      isStreaming: f.res?.isStreaming,
+      error: f.res?.error || undefined
+    }))
+  };
+}
+
+async function probeChatGPTFrames(tabId, bestFrameId) {
+  const anchors = currentPromptAnchors();
+  let frameIds = [0];
+  try {
+    const results = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['content/chatgpt.js'] });
+    frameIds = (results || []).map((r) => r.frameId).filter((id) => typeof id === 'number');
+    if (frameIds.length === 0) frameIds = [0];
+  } catch (_) {}
+  const out = [];
+  for (const frameId of frameIds) {
+    try {
+      const r = await chrome.tabs.sendMessage(tabId, { type: 'CHATGPT_DOM_PROBE', ...anchors }, { frameId });
+      const p = r?.probe || null;
+      if (!p) {
+        out.push({ frameId, error: r?.error || 'no probe' });
+      } else if (frameId === bestFrameId || p.turnStrategy !== 'none' || !p.isTop) {
+        out.push({ frameId, ...p });
+      } else {
+        out.push({ frameId, href: p.href, isTop: p.isTop, bodyLen: p.bodyLen, iframes: p.iframes, counts: p.counts, turnStrategy: p.turnStrategy, composerButtons: p.composerButtons, streamingMatch: p.streamingMatch });
+      }
+    } catch (err) {
+      out.push({ frameId, error: err?.message || String(err) });
+    }
+  }
+  return out;
 }
 
 // Automatically pull translation from an open ChatGPT tab if the article has no saved translation yet
@@ -1913,10 +1968,7 @@ btnCaptureFromChatGPT.addEventListener('click', async () => {
 
     // Record what the page looked like so selector drift can be fixed from the diagnostics log
     try {
-      const probeRes = await chrome.tabs.sendMessage(chatTab.id, {
-        type: 'CHATGPT_DOM_PROBE',
-        ...currentPromptAnchors()
-      });
+      const probes = await probeChatGPTFrames(chatTab.id, res?.frameId);
       sendToBackground({
         type: 'M2H_LOG',
         level: res?.ok ? 'info' : 'error',
@@ -1927,9 +1979,11 @@ btnCaptureFromChatGPT.addEventListener('click', async () => {
           error: res?.error,
           chars: res?.markdown?.length,
           source: res?.source,
+          frameId: res?.frameId,
+          frames: res?.frames,
           isStreaming: res?.isStreaming,
           isThinking: res?.isThinking,
-          probe: probeRes?.probe
+          probes
         }
       });
     } catch (_) {}
